@@ -16,6 +16,50 @@ Common options:
 - `--name <name>` / `-n <name>`: Set the session display name at startup
 - `--no-session`: Disable session persistence
 - `--session-dir <path>`: Custom session storage directory
+- `--sock <path>`: Listen on a unix socket instead of stdio (mode `0600`;
+  the agent outlives clients — attach/detach/reattach supported)
+
+## Attaching the Stock TUI (`pi attach`)
+
+`pi attach` runs the full interactive TUI against an agent behind an RPC
+endpoint. No local session, model, or extension loading happens on the
+attach host — every session operation flows through the protocol, and the
+TUI is the stock one (same binary, same components).
+
+```bash
+# Attach to a long-lived agent over a unix socket
+pi attach --sock /tmp/agent.sock
+
+# Spawn the agent per attach through any exec bridge
+pi attach --cmd "docker exec -i sandbox pi --mode rpc"
+pi attach --cmd "ssh host pi --mode rpc"
+```
+
+Semantics:
+
+- **Settings split**: theme, keybindings, and editor preferences come from
+  the *client's* `~/.pi/agent/settings.json`. Session-scoped settings
+  (auto-compaction, retry, steering/follow-up mode) are session state and
+  flow through the protocol. Trust stores are client-local.
+- **Exit**: with `--cmd`, exiting the TUI sends `shutdown` (the agent is
+  per-attach). With `--sock`, exiting sends `detach` and the agent keeps
+  its session — reattaching resumes right where you left off.
+- **Takeover**: a second `--sock` attach takes over; the first client is
+  notified via the `detached` event and exits its TUI.
+- **`/resume`**: the session picker lists the *agent's* sessions over the
+  wire (`list_sessions`, `rename_session`); full-text search is limited
+  to session names/first messages.
+
+Known v1 degradations while attached:
+
+- `/login`, `/logout`, and credential management are not remotable —
+  authenticate on the agent host. OAuth status is mirrored for display.
+- Extension custom renderers fall back to default rendering; extension
+  *dialogs* (select/confirm/input/editor) render with stock TUI components.
+- `/import` and `exportToJsonl`'s sync form are unavailable (the TUI's
+  `/export` uses the async form and works).
+- `@`-file completion browses the *client* filesystem (content expansion
+  happens agent-side only for agent-local paths).
 
 ## Protocol Overview
 

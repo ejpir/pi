@@ -5453,7 +5453,13 @@ export class InteractiveMode {
 
 		try {
 			if (outputPath?.endsWith(".jsonl")) {
-				const filePath = this.session.exportToJsonl(outputPath);
+				// Remote runtimes (attach mode) implement the async variant; the
+				// sync exportToJsonl throws there since it crosses a process boundary.
+				const asyncExport = (this.session as { exportToJsonlAsync?: (path?: string) => Promise<string> })
+					.exportToJsonlAsync;
+				const filePath = asyncExport
+					? await asyncExport.call(this.session, outputPath)
+					: this.session.exportToJsonl(outputPath);
 				this.showStatus(`Session exported to: ${filePath}`);
 			} else {
 				const filePath = await this.session.exportToHtml(outputPath);
