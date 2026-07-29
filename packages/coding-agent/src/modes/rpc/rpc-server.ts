@@ -945,11 +945,24 @@ export class RpcServer {
 
 			case "get_auth_status": {
 				const modelRuntime = session.modelRuntime;
-				const oauthProviders = modelRuntime
-					.getProviders()
+				const providers = modelRuntime.getProviders();
+				const oauthProviders = providers
 					.filter((provider) => modelRuntime.isUsingOAuth(provider.id))
 					.map((provider) => provider.id);
-				return this.success(id, "get_auth_status", { oauthProviders: [...oauthProviders] });
+				const credentials = await modelRuntime.listCredentials().catch(() => []);
+				return this.success(id, "get_auth_status", {
+					oauthProviders: [...oauthProviders],
+					providers: providers.map((provider) => ({
+						id: provider.id,
+						name: provider.name,
+						oauth: Boolean(provider.auth.oauth),
+						apiKey: Boolean(provider.auth.apiKey),
+					})),
+					credentials: credentials.map((credential) => ({
+						providerId: credential.providerId,
+						type: credential.type,
+					})),
+				});
 			}
 
 			case "refresh_models": {

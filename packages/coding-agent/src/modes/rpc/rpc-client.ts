@@ -24,6 +24,7 @@ import type { ContextUsage, ToolInfo } from "../../core/extensions/types.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
+	RpcAuthStatus,
 	RpcCommand,
 	RpcDetachedEvent,
 	RpcExtensionErrorEvent,
@@ -297,6 +298,34 @@ export class RpcClient {
 	/** Whether the server advertised a capability in its hello. */
 	hasCapability(capability: string): boolean {
 		return this.hello?.capabilities.includes(capability) ?? false;
+	}
+
+	/**
+	 * Re-dial the agent after the socket connection was lost (e.g. the agent
+	 * process was restarted). Socket transports only. Event and close
+	 * listeners survive the reconnect; in-flight requests were already
+	 * rejected when the connection dropped. Resolves after the new
+	 * connection's hello handshake completes.
+	 */
+	async reconnect(): Promise<void> {
+		if (!this.options.socketPath) {
+			throw new Error("reconnect is only supported for socket transports");
+		}
+		if (this.socket && !this.socket.destroyed && this.hello) {
+			return; // still connected
+		}
+		this.stopReading?.();
+		this.stopReading = null;
+		this.socket = null;
+		this.writer = null;
+		this.exitError = null;
+		this.hello = undefined;
+		this.stderr = "";
+
+		this.startSocket(this.options.socketPath);
+		if (this.options.requireHello ?? true) {
+			await this.waitForHello();
+		}
 	}
 
 	/**
@@ -753,9 +782,9 @@ export class RpcClient {
 	}
 
 	/** Provider ids currently authenticated via OAuth on the agent host. */
-	async getAuthStatus(): Promise<{ oauthProviders: string[] }> {
+	async getAuthStatus(): Promise<RpcAuthStatus> {
 		const response = await this.send({ type: "get_auth_status" });
-		return this.getData<{ oauthProviders: string[] }>(response);
+		return this.getData<RpcAuthStatus>(response);
 	}
 
 	/** Refresh model availability (network fetch of provider catalogs). */

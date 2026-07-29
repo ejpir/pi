@@ -128,6 +128,8 @@ export async function createRpcSocketServer(
 	const { socketPath } = options;
 	let listener: Server | undefined;
 
+	const connections = new Set<Socket>();
+
 	const close = async (): Promise<void> => {
 		const current = listener;
 		if (!current) return;
@@ -136,6 +138,11 @@ export async function createRpcSocketServer(
 			current.close(() => resolve());
 			// close() only fires once all connections end; don't wait forever.
 			setTimeout(resolve, 2000).unref();
+			// Destroy accepted connections: mirrors process-exit semantics and
+			// lets peers observe the close (in-process restarts, tests).
+			for (const connection of connections) {
+				connection.destroy();
+			}
 		});
 		cleanupSocketFile(socketPath);
 	};
@@ -157,6 +164,8 @@ export async function createRpcSocketServer(
 		// Never let a misbehaving or abruptly-reset peer crash the server:
 		// 'error' (e.g. ECONNRESET) is always followed by 'close', which
 		// drives the connection-loss path in RpcServer.
+		connections.add(socket);
+		socket.on("close", () => connections.delete(socket));
 		socket.on("error", () => {});
 		rpcServer.attachConnection(createSocketConnection(socket));
 	});

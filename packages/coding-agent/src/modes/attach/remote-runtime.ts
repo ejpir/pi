@@ -10,7 +10,7 @@
  */
 
 import type { AgentSession } from "../../core/agent-session.ts";
-import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
+import { type AgentSessionRuntime, SessionImportUnsupportedError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionServices } from "../../core/agent-session-services.ts";
 import type { ModelRuntime } from "../../core/model-runtime.ts";
 import type { ResourceLoader } from "../../core/resource-loader.ts";
@@ -107,7 +107,9 @@ export class RemoteAgentSessionRuntime {
 	}
 
 	async importFromJsonl(): Promise<never> {
-		throw new Error("Session import is not supported in attach mode — import on the agent host");
+		throw new SessionImportUnsupportedError(
+			"Session import is not supported in attach mode — import on the agent host",
+		);
 	}
 
 	async dispose(): Promise<void> {
@@ -133,9 +135,17 @@ export class RemoteAgentSessionRuntime {
 		});
 	}
 
-	private async handleSessionChanged(): Promise<void> {
-		if (this.rebinding) return;
-		this.rebinding = true;
+	/**
+	 * Rebind the TUI after the client reconnected to a (restarted) agent:
+	 * invalidate session-derived UI state, refetch the mirror from the new
+	 * server, then rebind. The session on the other end may be a brand-new
+	 * one or the same session file resumed — the mirror reflects either.
+	 */
+	async handleReconnect(): Promise<void> {
+		await this.rebindFromMirror();
+	}
+
+	private async rebindFromMirror(): Promise<void> {
 		try {
 			this.beforeInvalidateCb?.();
 			await this.remoteSession.refetchAll();
@@ -143,6 +153,14 @@ export class RemoteAgentSessionRuntime {
 		} catch {
 			// Rebind failures must not kill the event loop; the mirror is
 			// already refetched, so the TUI stays usable.
+		}
+	}
+
+	private async handleSessionChanged(): Promise<void> {
+		if (this.rebinding) return;
+		this.rebinding = true;
+		try {
+			await this.rebindFromMirror();
 		} finally {
 			this.rebinding = false;
 			const waiter = this.rebindWaiter;

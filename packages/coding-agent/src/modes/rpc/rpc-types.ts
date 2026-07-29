@@ -127,6 +127,16 @@ export type RpcCapability = (typeof RPC_CAPABILITIES)[number];
 // ============================================================================
 
 /** A command available for invocation via prompt */
+/** Auth state of the agent host, mirrored by attach clients. */
+export interface RpcAuthStatus {
+	/** Providers currently authenticated via OAuth. */
+	oauthProviders: string[];
+	/** All providers with their auth capabilities. */
+	providers: Array<{ id: string; name: string; oauth: boolean; apiKey: boolean }>;
+	/** Stored credentials (logout selector). */
+	credentials: Array<{ providerId: string; type: string }>;
+}
+
 export interface RpcSlashCommand {
 	/** Command name (without leading slash) */
 	name: string;
@@ -342,7 +352,13 @@ export type RpcResponse =
 			success: true;
 			data: { steering: string[]; followUp: string[] };
 	  }
-	| { id?: string; type: "response"; command: "get_auth_status"; success: true; data: { oauthProviders: string[] } }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_auth_status";
+			success: true;
+			data: RpcAuthStatus;
+	  }
 	| { id?: string; type: "response"; command: "refresh_models"; success: true }
 	| { id?: string; type: "response"; command: "rename_session"; success: true }
 

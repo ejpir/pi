@@ -1041,11 +1041,20 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Optional listener invoked synchronously after every entry is appended
+	 * (messages, compaction/branch summaries, labels, model/thinking changes,
+	 * session info, custom entries). AgentSession wires this to emit the
+	 * public entry_appended event.
+	 */
+	onEntryAppended: ((entry: SessionEntry) => void) | undefined;
+
 	private _appendEntry(entry: SessionEntry): void {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
+		this.onEntryAppended?.(entry);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.

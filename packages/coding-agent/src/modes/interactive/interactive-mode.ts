@@ -52,7 +52,11 @@ import {
 	VERSION,
 } from "../../config.ts";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
-import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
+import {
+	type AgentSessionRuntime,
+	SessionImportFileNotFoundError,
+	SessionImportUnsupportedError,
+} from "../../core/agent-session-runtime.ts";
 import {
 	CACHE_TTL_MS,
 	type CacheMiss,
@@ -5535,7 +5539,7 @@ export class InteractiveMode {
 				this.showStatus(`Session imported from: ${inputPath}`);
 				return;
 			}
-			if (error instanceof SessionImportFileNotFoundError) {
+			if (error instanceof SessionImportFileNotFoundError || error instanceof SessionImportUnsupportedError) {
 				this.showError(`Failed to import session: ${error.message}`);
 				return;
 			}

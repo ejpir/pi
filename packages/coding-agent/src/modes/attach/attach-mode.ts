@@ -80,9 +80,43 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 	});
 
 	let detachReason: string | undefined;
+	let tuiStopped = false;
+	let interactiveRef: InteractiveMode | undefined;
 	remote.onDetached = (reason) => {
-		detachReason = reason;
+		// Server-initiated: takeover means another client owns the agent now —
+		// exit immediately. shutdown/connection_lost are followed by the
+		// transport closing; the reconnect loop below handles those.
+		if (reason === "takeover") {
+			detachReason = reason;
+			interactiveRef?.stop();
+		}
 	};
+
+	// Reconnect loop: when the socket drops (agent restarted, crashed, or
+	// shut down), keep redialing. A restarted agent gets a fresh mirror and
+	// the TUI rebinds to whatever session the new server holds.
+	let reconnecting = false;
+	client.onClose((error) => {
+		if (!error || tuiStopped || reconnecting) return;
+		reconnecting = true;
+		void (async () => {
+			const deadline = Date.now() + 30_000;
+			while (!tuiStopped && Date.now() < deadline) {
+				try {
+					await client.reconnect();
+					await runtime.handleReconnect();
+					reconnecting = false;
+					return;
+				} catch {
+					await new Promise((resolve) => setTimeout(resolve, 500));
+				}
+			}
+			if (!tuiStopped) {
+				detachReason = "connection lost";
+				interactiveRef?.stop();
+			}
+		})();
+	});
 
 	const sessionPicker: SessionPickerHooks = {
 		list: async (onProgress) => {
@@ -106,10 +140,12 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 		sessionPicker,
 		verbose: options.verbose,
 	});
+	interactiveRef = interactive;
 
 	try {
 		await interactive.run();
 	} finally {
+		tuiStopped = true;
 		stopThemeWatcher();
 		if (detachReason) {
 			// The server pushed us off (takeover or shutdown); transport is gone.

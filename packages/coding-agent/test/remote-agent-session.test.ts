@@ -227,6 +227,74 @@ describe("RemoteAgentSession facade", () => {
 		expect(remote.model?.provider).toBe(available[0].provider);
 	});
 
+	it("getSessionStats is synchronous and matches the SessionStats shape", async () => {
+		const fixture = await startFixture();
+		const { remote } = await connectFacade(fixture);
+
+		await remote.prompt("hello");
+		await remote.waitForIdle();
+
+		const stats = remote.getSessionStats();
+		expect(stats).not.toBeInstanceOf(Promise);
+		expect(stats.tokens).toEqual({
+			input: expect.any(Number),
+			output: expect.any(Number),
+			cacheRead: expect.any(Number),
+			cacheWrite: expect.any(Number),
+			total: expect.any(Number),
+		});
+		expect(stats.userMessages).toBe(1);
+		expect(stats.assistantMessages).toBe(1);
+		expect(stats.sessionId).toBe(remote.sessionId);
+		expect(typeof stats.cost).toBe("number");
+	});
+
+	it("clearQueue and getUserMessagesForForking are synchronous", async () => {
+		const fixture = await startFixture({ streamDelayMs: 300 });
+		const { remote } = await connectFacade(fixture);
+
+		await remote.prompt("first");
+		await remote.followUp("second");
+		await vi.waitFor(() => expect(remote.getFollowUpMessages()).toContain("second"));
+
+		const cleared = remote.clearQueue();
+		expect(cleared).not.toBeInstanceOf(Promise);
+		expect(cleared.followUp).toContain("second");
+		await remote.waitForIdle();
+
+		const forking = remote.getUserMessagesForForking();
+		expect(forking).not.toBeInstanceOf(Promise);
+		expect(forking.some((m) => m.text === "first")).toBe(true);
+	});
+
+	it("getTree returns a synchronous SessionTreeNode[] over mirrored entries", async () => {
+		const fixture = await startFixture();
+		const { remote } = await connectFacade(fixture);
+
+		await remote.prompt("hello");
+		await remote.waitForIdle();
+
+		const roots = remote.sessionManager.getTree();
+		expect(Array.isArray(roots)).toBe(true);
+		expect(roots.length).toBeGreaterThan(0);
+		const count = (nodes: typeof roots): number => nodes.reduce((acc, node) => acc + 1 + count(node.children), 0);
+		expect(count(roots)).toBe(remote.sessionManager.getEntries().length);
+	});
+
+	it("mirrors auth capabilities and credentials for /login and /logout", async () => {
+		const fixture = await startFixture();
+		const { remote } = await connectFacade(fixture);
+
+		const providers = remote.modelRuntime.getProviders();
+		const anthropic = providers.find((p) => p.id === "anthropic");
+		expect(anthropic).toBeDefined();
+		expect(anthropic?.auth.apiKey ?? anthropic?.auth.oauth).toBeTruthy();
+
+		const credentials = await remote.modelRuntime.listCredentials();
+		expect(credentials).not.toBeInstanceOf(Promise);
+		expect(credentials.some((c) => c.providerId === "anthropic")).toBe(true);
+	});
+
 	it("modelRuntime.refresh returns the ModelsRefreshResult shape", async () => {
 		const fixture = await startFixture();
 		const { remote } = await connectFacade(fixture);
@@ -333,6 +401,53 @@ describe("RemoteAgentSession facade", () => {
 		expect(remote.sessionId).toBe(fixtureB.session.sessionId);
 		expect(rebinds).toEqual(["before", `rebind:${fixtureB.session.sessionId}`]);
 		expect(remote.sessionManager.getCwd()).toBe(fixtureB.tempDir);
+	});
+
+	it("reconnects to a restarted agent and rebinds the mirror", async () => {
+		const fixtureA = await startFixture({ suffix: "re-a" });
+		const fixtureB = await startFixture({ suffix: "re-b" });
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+		const rebinds: string[] = [];
+		runtime.setRebindSession(async (session) => {
+			rebinds.push(`rebind:${session.sessionId}`);
+		});
+
+		expect(remote.sessionId).toBe(fixtureA.session.sessionId);
+
+		// Simulate an agent restart: the old server dies, a new one binds the
+		// same path holding a different session.
+		const socketPath = fixtureA.socketPath;
+		const closed = new Promise<void>((resolve) => {
+			client.onClose(() => resolve());
+		});
+		await fixtureA.socketServer.close();
+		await closed;
+		const replacement = await createRpcSocketServer(fixtureB.runtimeHost, { socketPath });
+		fixtures.push({
+			tempDir: fixtureB.tempDir,
+			socketPath,
+			runtimeHost: fixtureB.runtimeHost,
+			socketServer: replacement,
+			session: fixtureB.session,
+		});
+
+		await client.reconnect();
+		await runtime.handleReconnect();
+
+		expect(remote.sessionId).toBe(fixtureB.session.sessionId);
+		expect(remote.sessionManager.getCwd()).toBe(fixtureB.tempDir);
+		expect(rebinds).toEqual([`rebind:${fixtureB.session.sessionId}`]);
+
+		// The new connection is fully usable.
+		await remote.prompt("hello after reconnect");
+		await remote.waitForIdle();
+		expect(remote.getLastAssistantText()).toBe("done");
 	});
 
 	it("notifies on server-initiated detach (takeover)", async () => {

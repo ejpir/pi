@@ -14,7 +14,7 @@
  */
 
 import type { AgentMessage, AgentState, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Model } from "@earendil-works/pi-ai";
+import { contentText, type ImageContent, type Model } from "@earendil-works/pi-ai";
 import type { AgentSessionEvent, ExtensionBindings, ModelCycleResult, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
@@ -24,6 +24,7 @@ import { buildContextEntries, type SessionEntry, type SessionTreeNode } from "..
 import type { SettingsManager } from "../../core/settings-manager.ts";
 import type { Skill } from "../../core/skills.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
+import { addUsageToTotals, createUsageTotals } from "../../core/usage-totals.ts";
 import type { Theme } from "../interactive/theme/theme.ts";
 import type { ModelInfo, RpcClient, RpcServerEvent } from "../rpc/rpc-client.ts";
 import type { RpcExtensionUIRequest, RpcResources, RpcSlashCommand } from "../rpc/rpc-types.ts";
@@ -60,7 +61,6 @@ export class RemoteAgentSession {
 	private _messages: AgentMessage[] = [];
 	private _entries: SessionEntry[] = [];
 	private _leafId: string | null = null;
-	private _treeCache: { tree: SessionTreeNode[]; leafId: string | null } | undefined;
 	private _systemPrompt = "";
 	private _contextUsage: ContextUsage | null = null;
 	private _tools: ToolInfo[] = [];
@@ -70,6 +70,8 @@ export class RemoteAgentSession {
 	// objects. We store the declared shape and cast at the TUI boundary.
 	private _availableModels: ModelInfo[] = [];
 	private _oauthProviders = new Set<string>();
+	private _authProviders: Array<{ id: string; name: string; oauth: boolean; apiKey: boolean }> = [];
+	private _credentials: Array<{ providerId: string; type: string }> = [];
 	private _steeringMessages: string[] = [];
 	private _followUpMessages: string[] = [];
 	private _resources: RpcResources | undefined;
@@ -148,7 +150,13 @@ export class RemoteAgentSession {
 		};
 		this._entries = entries.entries;
 		this._leafId = entries.leafId;
-		this._treeCache = undefined;
+		// After a reconnect the hello (and its cwd) belongs to the new agent;
+		// during a session_changed rebind the hello is stale, so only adopt it
+		// when it matches the session we just fetched.
+		const hello = this.client.getHello();
+		if (hello && hello.sessionId === state.sessionId) {
+			this._cwd = hello.cwd;
+		}
 		this._messages = messages;
 		this._systemPrompt = systemPrompt;
 		this._contextUsage = usage;
@@ -156,6 +164,8 @@ export class RemoteAgentSession {
 		this._availableThinkingLevels = levels;
 		this._availableModels = models;
 		this._oauthProviders = new Set(auth.oauthProviders);
+		this._authProviders = auth.providers ?? [];
+		this._credentials = auth.credentials ?? [];
 		this._resources = resources;
 	}
 
@@ -242,7 +252,6 @@ export class RemoteAgentSession {
 				const entry = e.entry as SessionEntry;
 				this._entries.push(entry);
 				this._leafId = entry.id;
-				this._treeCache = undefined;
 				break;
 			}
 			case "session_info_changed":
@@ -441,11 +450,15 @@ export class RemoteAgentSession {
 		return this._followUpMessages;
 	}
 
-	async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
-		const cleared = await this.client.clearQueue();
+	// Synchronous like AgentSession.clearQueue (the TUI destructures the
+	// result without awaiting): clear the mirror immediately and let the
+	// server confirm via queue_update.
+	clearQueue(): { steering: string[]; followUp: string[] } {
+		const cleared = { steering: this._steeringMessages, followUp: this._followUpMessages };
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this.mirror.pendingMessageCount = 0;
+		void this.client.clearQueue().catch(() => {});
 		return cleared;
 	}
 
@@ -496,8 +509,57 @@ export class RemoteAgentSession {
 		return result;
 	}
 
-	async getSessionStats(): Promise<SessionStats> {
-		return this.client.getSessionStats();
+	// Mirrors AgentSession.getSessionStats, computed client-side over the
+	// mirrored entries: the TUI calls this synchronously.
+	getSessionStats(): SessionStats {
+		let userMessages = 0;
+		let assistantMessages = 0;
+		let toolResults = 0;
+		let totalMessages = 0;
+		let toolCalls = 0;
+		const usageTotals = createUsageTotals();
+
+		for (const entry of this._entries) {
+			if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+				addUsageToTotals(usageTotals, entry.usage);
+			}
+			if (entry.type !== "message") continue;
+			totalMessages++;
+			const message = entry.message;
+			if (message.role === "user") {
+				userMessages++;
+			} else if (message.role === "toolResult") {
+				toolResults++;
+				if (message.usage) {
+					addUsageToTotals(usageTotals, message.usage);
+				}
+			} else if (message.role === "assistant") {
+				assistantMessages++;
+				if (Array.isArray(message.content)) {
+					toolCalls += message.content.filter((c) => c.type === "toolCall").length;
+				}
+				addUsageToTotals(usageTotals, message.usage);
+			}
+		}
+
+		return {
+			sessionFile: this.mirror.sessionFile,
+			sessionId: this.mirror.sessionId,
+			userMessages,
+			assistantMessages,
+			toolCalls,
+			toolResults,
+			totalMessages,
+			tokens: {
+				input: usageTotals.input,
+				output: usageTotals.output,
+				cacheRead: usageTotals.cacheRead,
+				cacheWrite: usageTotals.cacheWrite,
+				total: usageTotals.input + usageTotals.output + usageTotals.cacheRead + usageTotals.cacheWrite,
+			},
+			cost: usageTotals.cost,
+			contextUsage: this.getContextUsage(),
+		};
 	}
 
 	getContextUsage(): ContextUsage | undefined {
@@ -535,8 +597,19 @@ export class RemoteAgentSession {
 		return undefined;
 	}
 
-	async getUserMessagesForForking(): Promise<Array<{ entryId: string; text: string }>> {
-		return this.client.getForkMessages();
+	// Mirrors AgentSession.getUserMessagesForForking, computed client-side
+	// over the mirrored entries: the TUI consumes this synchronously.
+	getUserMessagesForForking(): Array<{ entryId: string; text: string }> {
+		const result: Array<{ entryId: string; text: string }> = [];
+		for (const entry of this._entries) {
+			if (entry.type !== "message") continue;
+			if (entry.message.role !== "user") continue;
+			const text = contentText(entry.message.content, "");
+			if (text) {
+				result.push({ entryId: entry.id, text });
+			}
+		}
+		return result;
 	}
 
 	// =========================================================================
@@ -656,7 +729,6 @@ export class RemoteAgentSession {
 		if (result) {
 			this._entries = result.entries;
 			this._leafId = result.leafId;
-			this._treeCache = undefined;
 		}
 	}
 
@@ -689,12 +761,27 @@ export class RemoteAgentSession {
 			this._availableModels.find((m) => m.provider === provider && m.id === modelId) as unknown as
 				| Model<any>
 				| undefined,
-		getProviders: (): Array<{ id: string; name: string; auth: Record<string, never> }> =>
-			[...new Set(this._availableModels.map((m) => m.provider))].map((id) => ({ id, name: id, auth: {} })),
-		getProvider: (provider: string): { id: string; name: string; auth: Record<string, never> } | undefined =>
-			this._availableModels.some((m) => m.provider === provider)
-				? { id: provider, name: provider, auth: {} }
-				: undefined,
+		// Provider capabilities mirrored from the agent's get_auth_status, so
+		// /login lists the agent's real providers; the login/logout actions
+		// themselves stay non-remotable and fail with a friendly error box.
+		getProviders: (): Array<{ id: string; name: string; auth: { oauth?: boolean; apiKey?: boolean } }> =>
+			this._authProviders.map((p) => ({
+				id: p.id,
+				name: p.name,
+				auth: { oauth: p.oauth || undefined, apiKey: p.apiKey || undefined },
+			})),
+		getProvider: (
+			provider: string,
+		): { id: string; name: string; auth: { oauth?: boolean; apiKey?: boolean } } | undefined => {
+			const found = this._authProviders.find((p) => p.id === provider);
+			return found
+				? {
+						id: found.id,
+						name: found.name,
+						auth: { oauth: found.oauth || undefined, apiKey: found.apiKey || undefined },
+					}
+				: undefined;
+		},
 		getError: (): string | undefined => undefined,
 		getProviderAuthStatus: (provider: string): { configured: boolean } => ({
 			configured: this._oauthProviders.has(provider),
@@ -709,9 +796,10 @@ export class RemoteAgentSession {
 		logout: async (): Promise<never> => {
 			throw new Error("OAuth logout is not available over attach — manage credentials on the agent host");
 		},
-		listCredentials: async (): Promise<never> => {
-			throw new Error("Credential management is not available over attach — manage credentials on the agent host");
-		},
+		// Rendering member: the logout selector lists the agent's stored
+		// credentials (mirrored via get_auth_status). The logout action itself
+		// still throws a friendly error, which the TUI surfaces in an error box.
+		listCredentials: async (): Promise<Array<{ providerId: string; type: string }>> => this._credentials,
 	};
 
 	readonly extensionRunner = {
@@ -803,15 +891,53 @@ export class RemoteAgentSession {
 		},
 		getEntries: (): SessionEntry[] => this._entries,
 		getLeafId: (): string | null => this._leafId,
-		getTree: (): { tree: SessionTreeNode[]; leafId: string | null } => {
-			// Tree is fetched lazily and cached; invalidated on entry_appended.
-			if (!this._treeCache) {
-				this._treeCache = { tree: [], leafId: this._leafId };
-				void this.client.getTree().then((result) => {
-					this._treeCache = result;
+		// Mirrors SessionManager.getTree, computed client-side over the
+		// mirrored entries: the TUI's tree selector consumes this synchronously.
+		getTree: (): SessionTreeNode[] => {
+			const entries = this._entries;
+			const labelsById = new Map<string, string>();
+			const labelTimestampsById = new Map<string, string>();
+			for (const entry of entries) {
+				if (entry.type === "label") {
+					if (entry.label) {
+						labelsById.set(entry.targetId, entry.label);
+						labelTimestampsById.set(entry.targetId, entry.timestamp);
+					} else {
+						labelsById.delete(entry.targetId);
+						labelTimestampsById.delete(entry.targetId);
+					}
+				}
+			}
+			const nodeMap = new Map<string, SessionTreeNode>();
+			const roots: SessionTreeNode[] = [];
+			for (const entry of entries) {
+				nodeMap.set(entry.id, {
+					entry,
+					children: [],
+					label: labelsById.get(entry.id),
+					labelTimestamp: labelTimestampsById.get(entry.id),
 				});
 			}
-			return this._treeCache;
+			for (const entry of entries) {
+				const node = nodeMap.get(entry.id)!;
+				if (entry.parentId === null || entry.parentId === entry.id) {
+					roots.push(node);
+				} else {
+					const parent = nodeMap.get(entry.parentId);
+					if (parent) {
+						parent.children.push(node);
+					} else {
+						roots.push(node);
+					}
+				}
+			}
+			const stack: SessionTreeNode[] = [...roots];
+			while (stack.length > 0) {
+				const node = stack.pop()!;
+				node.children.sort((a, b) => new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime());
+				stack.push(...node.children);
+			}
+			return roots;
 		},
 		buildContextEntries: (): SessionEntry[] => buildContextEntries(this._entries, this._leafId),
 		usesDefaultSessionDir: (): boolean => true,
