@@ -10,8 +10,12 @@ import type { ImageContent, Model } from "@earendil-works/pi-ai";
 import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
+import type { ContextUsage, ToolInfo } from "../../core/extensions/types.ts";
+import type { PromptTemplate } from "../../core/prompt-templates.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
+import type { Skill } from "../../core/skills.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
+import type { Theme } from "../interactive/theme/theme.ts";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -76,6 +80,34 @@ export type RpcCommand =
 	| { id?: string; type: "shutdown" }
 	| { id?: string; type: "detach" }
 
+	// Remote-attach additions (P2)
+	| { id?: string; type: "get_context_usage" }
+	| { id?: string; type: "get_system_prompt" }
+	| { id?: string; type: "get_tools" }
+	| { id?: string; type: "get_resources" }
+	| {
+			id?: string;
+			type: "set_scoped_models";
+			models: Array<{ provider: string; id: string; thinkingLevel?: ThinkingLevel }>;
+	  }
+	| {
+			id?: string;
+			type: "navigate_tree";
+			targetId: string;
+			summarize?: boolean;
+			customInstructions?: string;
+			replaceInstructions?: boolean;
+			label?: string;
+	  }
+	| { id?: string; type: "reload" }
+	| { id?: string; type: "export_jsonl"; outputPath?: string }
+	| { id?: string; type: "abort_compaction" }
+	| { id?: string; type: "abort_branch_summary" }
+	| { id?: string; type: "clear_queue" }
+	| { id?: string; type: "get_auth_status" }
+	| { id?: string; type: "refresh_models" }
+	| { id?: string; type: "rename_session"; sessionPath: string; name: string }
+
 	// Filesystem (executed against the agent-side filesystem)
 	| { id?: string; type: "fs_complete"; prefix: string; limit?: number }
 	| { id?: string; type: "read_file"; path: string }
@@ -104,6 +136,29 @@ export interface RpcSlashCommand {
 	source: "extension" | "prompt" | "skill";
 	/** Source metadata for the owning resource */
 	sourceInfo: SourceInfo;
+	/** Argument hint shown in autocomplete, e.g. "<file> [options]". Prompt templates only. */
+	argumentHint?: string;
+}
+
+// ============================================================================
+// RPC Resources (for get_resources response)
+// ============================================================================
+
+/**
+ * Metadata about the resources loaded into the agent session. Everything
+ * a remote UI needs for autocomplete and the "loaded resources" display.
+ * Prompt template content is omitted — expansion happens agent-side in
+ * session.prompt().
+ */
+export interface RpcResources {
+	skills: Skill[];
+	prompts: Array<Omit<PromptTemplate, "content">>;
+	themes: Theme[];
+	extensions: Array<{ path: string; sourceInfo?: SourceInfo; hidden?: boolean }>;
+	extensionErrors: Array<{ path: string; error: string }>;
+	agentsFiles: Array<{ path: string }>;
+	systemPromptSource?: { path: string };
+	appendSystemPromptSources: Array<{ path: string }>;
 }
 
 // ============================================================================
@@ -117,6 +172,8 @@ export interface RpcSessionState {
 	isCompacting: boolean;
 	steeringMode: "all" | "one-at-a-time";
 	followUpMode: "all" | "one-at-a-time";
+	/** Models offered by the cycle-model UI, with their preferred thinking levels. */
+	scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	sessionFile?: string;
 	sessionId: string;
 	sessionName?: string;
@@ -249,6 +306,46 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "shutdown"; success: true }
 	| { id?: string; type: "response"; command: "detach"; success: true }
 
+	// Remote-attach additions (P2)
+	| {
+			id?: string;
+			type: "response";
+			command: "get_context_usage";
+			success: true;
+			data: ContextUsage | null;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_system_prompt";
+			success: true;
+			data: { systemPrompt: string };
+	  }
+	| { id?: string; type: "response"; command: "get_tools"; success: true; data: { tools: ToolInfo[] } }
+	| { id?: string; type: "response"; command: "get_resources"; success: true; data: RpcResources }
+	| { id?: string; type: "response"; command: "set_scoped_models"; success: true }
+	| {
+			id?: string;
+			type: "response";
+			command: "navigate_tree";
+			success: true;
+			data: { cancelled: boolean; editorText?: string };
+	  }
+	| { id?: string; type: "response"; command: "reload"; success: true }
+	| { id?: string; type: "response"; command: "export_jsonl"; success: true; data: { path: string } }
+	| { id?: string; type: "response"; command: "abort_compaction"; success: true }
+	| { id?: string; type: "response"; command: "abort_branch_summary"; success: true }
+	| {
+			id?: string;
+			type: "response";
+			command: "clear_queue";
+			success: true;
+			data: { steering: string[]; followUp: string[] };
+	  }
+	| { id?: string; type: "response"; command: "get_auth_status"; success: true; data: { oauthProviders: string[] } }
+	| { id?: string; type: "response"; command: "refresh_models"; success: true }
+	| { id?: string; type: "response"; command: "rename_session"; success: true }
+
 	// Filesystem
 	| {
 			id?: string;
@@ -299,6 +396,25 @@ export interface RpcHello {
 export interface RpcDetachedEvent {
 	type: "detached";
 	reason: "takeover" | "shutdown" | "detach";
+}
+
+/**
+ * Emitted when the server rebinds to a different session (e.g. an
+ * extension invoked newSession/switchSession/fork server-side). Clients
+ * mirroring session state should refetch on this event.
+ */
+export interface RpcSessionChangedEvent {
+	type: "session_changed";
+	sessionId: string;
+	cwd: string;
+}
+
+/** Emitted when an extension event handler throws on the agent host. */
+export interface RpcExtensionErrorEvent {
+	type: "extension_error";
+	extensionPath: string;
+	event: string;
+	error: string;
 }
 
 /** Serializable form of SessionInfo (dates as ISO strings). */

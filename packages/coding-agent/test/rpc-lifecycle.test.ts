@@ -8,6 +8,7 @@ import { AgentSession } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ExtensionFactory } from "../src/core/extensions/types.ts";
+import type { PromptTemplate } from "../src/core/prompt-templates.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
@@ -85,6 +86,7 @@ function parseOutput(outputLines: string[]): Array<Record<string, unknown>> {
 interface HarnessOptions {
 	extensions?: ExtensionFactory[];
 	sessionDir?: boolean;
+	prompts?: Array<{ name: string; description: string; argumentHint?: string; content: string }>;
 }
 
 async function createRuntimeHost(
@@ -117,12 +119,20 @@ async function createRuntimeHost(
 		? SessionManager.create(tempDir, join(tempDir, "sessions"))
 		: SessionManager.inMemory(tempDir);
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
-	const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+	const authStorage = AuthStorage.inMemory({
+		anthropic: { type: "api_key", key: "test-key" },
+	});
 	const modelRegistry = await createModelRegistry(authStorage, tempDir);
 
 	const extensionsResult = options.extensions
 		? await createTestExtensionsResult(options.extensions, tempDir)
 		: undefined;
+
+	const prompts: PromptTemplate[] | undefined = options.prompts?.map((p) => ({
+		...p,
+		filePath: join(tempDir, `${p.name}.md`),
+		sourceInfo: { source: "user", path: join(tempDir, `${p.name}.md`), scope: "user", origin: "top-level" },
+	}));
 
 	const session = new AgentSession({
 		agent,
@@ -130,7 +140,7 @@ async function createRuntimeHost(
 		settingsManager,
 		cwd: tempDir,
 		modelRuntime: getModelRuntime(modelRegistry),
-		resourceLoader: createTestResourceLoader({ extensionsResult }),
+		resourceLoader: createTestResourceLoader({ extensionsResult, prompts }),
 	});
 
 	const runtimeHost = {
@@ -416,5 +426,287 @@ describe("RpcServer attachment semantics", () => {
 		await vi.waitFor(() => expect(shutdownCalls).toEqual([0]));
 		expect(conn.sent.some((o) => o.id === "s1" && o.command === "shutdown" && o.success === true)).toBe(true);
 		expect(conn.sent.some((o) => o.type === "detached" && o.reason === "shutdown")).toBe(true);
+	});
+});
+
+// ============================================================================
+// P2 remote-attach protocol additions
+// ============================================================================
+
+describe("RpcServer P2 attach commands", () => {
+	let tempDir: string;
+	const cleanups: Array<() => Promise<void>> = [];
+
+	afterEach(async () => {
+		const toRun = cleanups.splice(0);
+		for (const cleanup of toRun) await cleanup();
+		if (tempDir && existsSync(tempDir)) rmSync(tempDir, { recursive: true });
+	});
+
+	async function startP2Server(
+		options: { prompts?: Array<{ name: string; description: string; argumentHint?: string; content: string }> } = {},
+	): Promise<RpcServer> {
+		tempDir = join(tmpdir(), `pi-rpc-p2-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+
+		const host = await createRuntimeHost(tempDir, { prompts: options.prompts });
+		cleanups.push(host.cleanup);
+
+		const server = new RpcServer(host.runtimeHost, {
+			connectionLoss: "grace",
+			detachGraceMs: 30_000,
+			onShutdown: () => {},
+		});
+		await server.start();
+		return server;
+	}
+
+	async function responseFor(conn: FakeConnection, id: string): Promise<Record<string, unknown>> {
+		await vi.waitFor(() => expect(conn.sent.some((o) => o.id === id && o.type === "response")).toBe(true));
+		return conn.sent.find((o) => o.id === id && o.type === "response")!;
+	}
+
+	it("includes scopedModels in get_state and applies set_scoped_models", async () => {
+		const server = await startP2Server();
+		const conn = new FakeConnection();
+		server.attachConnection(conn);
+
+		conn.emit({ id: "st1", type: "get_state" });
+		const initial = await responseFor(conn, "st1");
+		expect(initial.success).toBe(true);
+		expect((initial.data as { scopedModels: unknown[] }).scopedModels).toEqual([]);
+
+		conn.emit({ id: "sc1", type: "set_scoped_models", models: [{ provider: "bogus", id: "nope" }] });
+		const bogus = await responseFor(conn, "sc1");
+		expect(bogus.success).toBe(false);
+		expect(String(bogus.error)).toMatch(/Unknown model/);
+
+		conn.emit({ id: "am1", type: "get_available_models" });
+		const available = await responseFor(conn, "am1");
+		const models = (available.data as { models: Array<{ provider: string; id: string }> }).models;
+		if (models.length > 0) {
+			conn.emit({
+				id: "sc2",
+				type: "set_scoped_models",
+				models: [{ provider: models[0].provider, id: models[0].id, thinkingLevel: "low" }],
+			});
+			const set = await responseFor(conn, "sc2");
+			expect(set.success).toBe(true);
+
+			conn.emit({ id: "st2", type: "get_state" });
+			const after = await responseFor(conn, "st2");
+			const scoped = (after.data as { scopedModels: Array<{ model: { id: string }; thinkingLevel?: string }> })
+				.scopedModels;
+			expect(scoped.length).toBe(1);
+			expect(scoped[0].model.id).toBe(models[0].id);
+			expect(scoped[0].thinkingLevel).toBe("low");
+		}
+	});
+
+	it("answers get_context_usage / get_system_prompt / get_tools / get_resources", async () => {
+		const server = await startP2Server();
+		const conn = new FakeConnection();
+		server.attachConnection(conn);
+
+		conn.emit({ id: "cu1", type: "get_context_usage" });
+		const usage = await responseFor(conn, "cu1");
+		expect(usage.success).toBe(true);
+		expect(usage.data === null || typeof usage.data === "object").toBe(true);
+
+		conn.emit({ id: "sp1", type: "get_system_prompt" });
+		const prompt = await responseFor(conn, "sp1");
+		expect(prompt.success).toBe(true);
+		const systemPrompt = (prompt.data as { systemPrompt: string }).systemPrompt;
+		expect(systemPrompt.length).toBeGreaterThan(0);
+		expect(systemPrompt).toContain(tempDir);
+
+		conn.emit({ id: "tl1", type: "get_tools" });
+		const tools = await responseFor(conn, "tl1");
+		expect(tools.success).toBe(true);
+		expect(Array.isArray((tools.data as { tools: unknown[] }).tools)).toBe(true);
+
+		conn.emit({ id: "rs1", type: "get_resources" });
+		const resources = await responseFor(conn, "rs1");
+		expect(resources.success).toBe(true);
+		const data = resources.data as {
+			skills: unknown[];
+			prompts: unknown[];
+			themes: unknown[];
+			extensions: unknown[];
+			extensionErrors: unknown[];
+			agentsFiles: unknown[];
+			appendSystemPromptSources: unknown[];
+		};
+		expect(data.skills).toEqual([]);
+		expect(data.prompts).toEqual([]);
+		expect(data.themes).toEqual([]);
+		expect(Array.isArray(data.extensions)).toBe(true);
+		expect(Array.isArray(data.extensionErrors)).toBe(true);
+		expect(data.agentsFiles).toEqual([]);
+		expect(data.appendSystemPromptSources).toEqual([]);
+	});
+
+	it("serves prompt templates via get_resources and get_commands with argumentHint", async () => {
+		const server = await startP2Server({
+			prompts: [
+				{
+					name: "review",
+					description: "Review code",
+					argumentHint: "<file> [focus]",
+					content: "Review this: $1",
+				},
+			],
+		});
+		const conn = new FakeConnection();
+		server.attachConnection(conn);
+
+		conn.emit({ id: "rs2", type: "get_resources" });
+		const resources = await responseFor(conn, "rs2");
+		expect(resources.success).toBe(true);
+		const prompts = (resources.data as { prompts: Array<{ name: string; argumentHint?: string; content?: string }> })
+			.prompts;
+		expect(prompts.length).toBe(1);
+		expect(prompts[0].name).toBe("review");
+		expect(prompts[0].argumentHint).toBe("<file> [focus]");
+		expect(prompts[0].content).toBeUndefined();
+
+		conn.emit({ id: "gc1", type: "get_commands" });
+		const commands = await responseFor(conn, "gc1");
+		const review = (commands.data as { commands: Array<{ name: string; argumentHint?: string }> }).commands.find(
+			(c) => c.name === "review",
+		);
+		expect(review).toBeDefined();
+		expect(review!.argumentHint).toBe("<file> [focus]");
+	});
+
+	it("answers clear_queue / abort_compaction / abort_branch_summary / get_auth_status", async () => {
+		const server = await startP2Server();
+		const conn = new FakeConnection();
+		server.attachConnection(conn);
+
+		conn.emit({ id: "cq1", type: "clear_queue" });
+		const cleared = await responseFor(conn, "cq1");
+		expect(cleared.success).toBe(true);
+		expect(cleared.data).toEqual({ steering: [], followUp: [] });
+
+		conn.emit({ id: "ac1", type: "abort_compaction" });
+		expect((await responseFor(conn, "ac1")).success).toBe(true);
+
+		conn.emit({ id: "ab1", type: "abort_branch_summary" });
+		expect((await responseFor(conn, "ab1")).success).toBe(true);
+
+		conn.emit({ id: "au1", type: "get_auth_status" });
+		const auth = await responseFor(conn, "au1");
+		expect(auth.success).toBe(true);
+		expect(Array.isArray((auth.data as { oauthProviders: string[] }).oauthProviders)).toBe(true);
+	});
+
+	it("answers reload and export_jsonl", async () => {
+		const server = await startP2Server();
+		const conn = new FakeConnection();
+		server.attachConnection(conn);
+
+		conn.emit({ id: "rl1", type: "reload" });
+		expect((await responseFor(conn, "rl1")).success).toBe(true);
+
+		conn.emit({ id: "ex1", type: "export_jsonl", outputPath: join(tempDir, "export.jsonl") });
+		const exported = await responseFor(conn, "ex1");
+		expect(exported.success).toBe(true);
+		expect((exported.data as { path: string }).path).toBe(join(tempDir, "export.jsonl"));
+		expect(existsSync(join(tempDir, "export.jsonl"))).toBe(true);
+	});
+
+	it("answers refresh_models with a response (offline registry may decline)", async () => {
+		const server = await startP2Server();
+		const conn = new FakeConnection();
+		server.attachConnection(conn);
+
+		conn.emit({ id: "rf1", type: "refresh_models" });
+		const refreshed = await responseFor(conn, "rf1");
+		expect(refreshed.command).toBe("refresh_models");
+	});
+
+	it("renames a session file by path", async () => {
+		const server = await startP2Server();
+		const conn = new FakeConnection();
+		server.attachConnection(conn);
+
+		const sessionsDir = join(tempDir, "sessions");
+		mkdirSync(sessionsDir, { recursive: true });
+		const sessionPath = join(sessionsDir, "rename-me.jsonl");
+		writeFileSync(
+			sessionPath,
+			`${JSON.stringify({ type: "session", id: "rename-me", timestamp: new Date().toISOString(), cwd: tempDir })}\n`,
+		);
+
+		conn.emit({ id: "rn1", type: "rename_session", sessionPath, name: "my session" });
+		expect((await responseFor(conn, "rn1")).success).toBe(true);
+
+		const reopened = SessionManager.open(sessionPath);
+		expect(reopened.getSessionName()).toBe("my session");
+	});
+
+	it("navigates the tree without summarization", async () => {
+		const server = await startP2Server();
+		const conn = new FakeConnection();
+		server.attachConnection(conn);
+
+		// Produce some entries first.
+		conn.emit({ id: "pr1", type: "prompt", message: "hi" });
+		await vi.waitFor(() => expect(conn.sent.some((o) => o.type === "agent_settled")).toBe(true));
+
+		conn.emit({ id: "ge1", type: "get_entries" });
+		const entriesResponse = await responseFor(conn, "ge1");
+		const { entries, leafId } = entriesResponse.data as {
+			entries: Array<{ id: string }>;
+			leafId: string | null;
+		};
+		expect(entries.length).toBeGreaterThan(0);
+		expect(leafId).toBeTruthy();
+
+		conn.emit({ id: "nt1", type: "navigate_tree", targetId: leafId! });
+		const navigated = await responseFor(conn, "nt1");
+		expect(navigated.success).toBe(true);
+		expect((navigated.data as { cancelled: boolean }).cancelled).toBe(false);
+	});
+
+	it("emits session_changed when the server rebinds to a new session", async () => {
+		tempDir = join(tmpdir(), `pi-rpc-p2-rebind-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+
+		const hostA = await createRuntimeHost(tempDir);
+		cleanups.push(hostA.cleanup);
+		const dirB = join(tmpdir(), `pi-rpc-p2-rebind-b-${Date.now()}`);
+		mkdirSync(dirB, { recursive: true });
+		const hostB = await createRuntimeHost(dirB);
+		cleanups.push(hostB.cleanup);
+
+		const runtimeHost = {
+			...hostA.runtimeHost,
+			newSession: vi.fn(async () => {
+				(runtimeHost as { session: unknown }).session = hostB.session;
+				return { cancelled: false };
+			}),
+		} as unknown as AgentSessionRuntime;
+
+		const server = new RpcServer(runtimeHost, {
+			connectionLoss: "grace",
+			detachGraceMs: 30_000,
+			onShutdown: () => {},
+		});
+		await server.start();
+
+		const conn = new FakeConnection();
+		server.attachConnection(conn);
+		// The initial bind happened before attach: no session_changed yet.
+		expect(conn.sent.some((o) => o.type === "session_changed")).toBe(false);
+
+		conn.emit({ id: "ns1", type: "new_session" });
+		await responseFor(conn, "ns1");
+
+		const changed = conn.sent.filter((o) => o.type === "session_changed");
+		expect(changed.length).toBe(1);
+		expect(changed[0].sessionId).toBe(hostB.session.sessionId);
+		expect(changed[0].cwd).toBe(dirB);
 	});
 });

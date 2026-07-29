@@ -210,6 +210,7 @@ Response:
     "isCompacting": false,
     "steeringMode": "all",
     "followUpMode": "one-at-a-time",
+    "scopedModels": [{"model": {...}, "thinkingLevel": "low"}],
     "sessionFile": "/path/to/session.jsonl",
     "sessionId": "abc123",
     "sessionName": "my-feature-work",
@@ -950,8 +951,158 @@ Each command has:
   - `"project"`: Project-level (`./.pi/agent/`)
   - `"path"`: Explicit path via CLI or settings
 - `path`: Absolute file path to the command source (optional)
+- `argumentHint`: Argument hint shown in autocomplete (optional, prompt templates only), e.g. `"<file> [focus]"`
 
 **Note**: Built-in TUI commands (`/settings`, `/hotkeys`, etc.) are not included. They are handled only in interactive mode and would not execute if sent via `prompt`.
+
+### Remote Attach
+
+These commands exist primarily for remote-attach clients (TUIs mirroring a
+session running elsewhere). All paths in responses are on the agent host.
+
+#### get_context_usage
+
+Estimated context usage of the current session, or `null` when unknown (e.g.
+right after compaction).
+
+```json
+{"type": "get_context_usage"}
+```
+
+Response data: `{"tokens": 1234, "contextWindow": 262144, "percent": 0.5}` or `null`.
+
+#### get_system_prompt
+
+The effective system prompt of the current session.
+
+```json
+{"type": "get_system_prompt"}
+```
+
+Response data: `{"systemPrompt": "..."}`.
+
+#### get_tools
+
+Tool definitions (name, description, parameter schema, prompt guidelines,
+source) active in the current session.
+
+```json
+{"type": "get_tools"}
+```
+
+Response data: `{"tools": [...]}`.
+
+#### get_resources
+
+Metadata about loaded resources for autocomplete and "loaded resources"
+displays. Prompt template content is omitted (expansion happens agent-side
+when prompting).
+
+```json
+{"type": "get_resources"}
+```
+
+Response data:
+```json
+{
+  "skills": [{"name": "...", "description": "...", "filePath": "...", "baseDir": "...", "disableModelInvocation": false}],
+  "prompts": [{"name": "fix-tests", "description": "...", "argumentHint": "<file>", "filePath": "..."}],
+  "themes": [...],
+  "extensions": [{"path": "...", "hidden": false}],
+  "extensionErrors": [{"path": "...", "error": "..."}],
+  "agentsFiles": [{"path": "..."}],
+  "systemPromptSource": {"path": "..."},
+  "appendSystemPromptSources": [{"path": "..."}]
+}
+```
+
+#### set_scoped_models
+
+Replace the scoped model list (the cycle-model UI candidates). Each entry
+references a model by `provider` + `id` and an optional preferred
+`thinkingLevel`. Unknown models are rejected.
+
+```json
+{"type": "set_scoped_models", "models": [{"provider": "anthropic", "id": "claude-sonnet-4-5", "thinkingLevel": "low"}]}
+```
+
+The current list is reported as `scopedModels` in `get_state`.
+
+#### navigate_tree
+
+Navigate the session tree, optionally with branch summarization. Mirrors the
+TUI's tree navigation.
+
+```json
+{"type": "navigate_tree", "targetId": "entry-id", "summarize": true, "customInstructions": "...", "replaceInstructions": false, "label": "..."}
+```
+
+Response data: `{"cancelled": false, "editorText": "..."}` — `editorText` is
+present when the navigation selected user text to edit.
+
+#### reload
+
+Reload settings, resources, and extensions in the agent process.
+
+```json
+{"type": "reload"}
+```
+
+#### export_jsonl
+
+Export the current session to a JSONL file. Returns the file path on the
+agent host.
+
+```json
+{"type": "export_jsonl", "outputPath": "/tmp/session.jsonl"}
+```
+
+Response data: `{"path": "/tmp/session.jsonl"}`.
+
+#### abort_compaction / abort_branch_summary
+
+Abort an in-progress compaction or branch summarization.
+
+```json
+{"type": "abort_compaction"}
+{"type": "abort_branch_summary"}
+```
+
+#### clear_queue
+
+Clear queued steering and follow-up messages. Returns the cleared queues.
+
+```json
+{"type": "clear_queue"}
+```
+
+Response data: `{"steering": ["..."], "followUp": ["..."]}`.
+
+#### get_auth_status
+
+Provider ids currently authenticated via OAuth on the agent host.
+
+```json
+{"type": "get_auth_status"}
+```
+
+Response data: `{"oauthProviders": ["anthropic"]}`.
+
+#### refresh_models
+
+Refresh model availability (re-checks credentials and provider catalogs).
+
+```json
+{"type": "refresh_models"}
+```
+
+#### rename_session
+
+Rename a session by file path (used by remote session pickers).
+
+```json
+{"type": "rename_session", "sessionPath": "/path/to/session.jsonl", "name": "my session"}
+```
 
 ## Events
 
@@ -1260,6 +1411,20 @@ Emitted when the server ends a client attachment (socket mode, or before a `shut
 ```
 
 `reason` is one of `"takeover"` (another client attached), `"shutdown"` (agent terminating), or `"detach"`.
+
+### session_changed
+
+Emitted when the server rebinds to a different session — e.g. an extension
+invoked `newSession`/`switchSession`/`fork` agent-side, or a client issued
+one of those commands. Remote-attach clients mirroring session state should
+refetch (`get_state`, `get_entries`, `get_messages`, …) on this event.
+
+```json
+{"type": "session_changed", "sessionId": "abc123", "cwd": "/path/to/project"}
+```
+
+The initial bind happens before any client attaches, so clients do not see
+an event for the session they greet in `hello`.
 
 ### extension_error
 

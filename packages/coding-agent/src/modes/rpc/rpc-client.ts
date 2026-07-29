@@ -20,13 +20,19 @@ import type { ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
+import type { ContextUsage, ToolInfo } from "../../core/extensions/types.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
 	RpcCommand,
+	RpcDetachedEvent,
+	RpcExtensionErrorEvent,
+	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHello,
+	RpcResources,
 	RpcResponse,
+	RpcSessionChangedEvent,
 	RpcSessionInfo,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -82,7 +88,19 @@ export interface ModelInfo {
 	reasoning: boolean;
 }
 
-export type RpcEventListener = (event: AgentSessionEvent) => void;
+/**
+ * Events emitted by the server outside of command responses: the live
+ * AgentSession event stream plus server-level lifecycle/UI events.
+ * Consumers should narrow on `event.type`.
+ */
+export type RpcServerEvent =
+	| AgentSessionEvent
+	| RpcSessionChangedEvent
+	| RpcDetachedEvent
+	| RpcExtensionUIRequest
+	| RpcExtensionErrorEvent;
+
+export type RpcEventListener = (event: RpcServerEvent) => void;
 
 /** Called when the transport closes (process exit or socket close). */
 export type RpcCloseListener = (error: Error | null) => void;
@@ -645,6 +663,101 @@ export class RpcClient {
 	}
 
 	// =========================================================================
+	// Remote-attach additions (P2)
+	// =========================================================================
+
+	/** Estimated context usage of the current session, or null if unknown. */
+	async getContextUsage(): Promise<ContextUsage | null> {
+		const response = await this.send({ type: "get_context_usage" });
+		return this.getData<ContextUsage | null>(response);
+	}
+
+	/** The effective system prompt of the current session. */
+	async getSystemPrompt(): Promise<string> {
+		const response = await this.send({ type: "get_system_prompt" });
+		return this.getData<{ systemPrompt: string }>(response).systemPrompt;
+	}
+
+	/** Tool definitions (name, description, schema, guidelines) for the current session. */
+	async getTools(): Promise<ToolInfo[]> {
+		const response = await this.send({ type: "get_tools" });
+		return this.getData<{ tools: ToolInfo[] }>(response).tools;
+	}
+
+	/** Metadata about loaded resources (skills, prompt templates, themes, extensions, context files). */
+	async getResources(): Promise<RpcResources> {
+		const response = await this.send({ type: "get_resources" });
+		return this.getData<RpcResources>(response);
+	}
+
+	/** Replace the scoped model list offered by the cycle-model UI. */
+	async setScopedModels(
+		models: Array<{ provider: string; id: string; thinkingLevel?: ThinkingLevel }>,
+	): Promise<void> {
+		await this.send({ type: "set_scoped_models", models });
+	}
+
+	/**
+	 * Navigate the session tree, optionally with branch summarization.
+	 * Returns whether the navigation was cancelled and any editor text to adopt.
+	 */
+	async navigateTree(
+		targetId: string,
+		options: {
+			summarize?: boolean;
+			customInstructions?: string;
+			replaceInstructions?: boolean;
+			label?: string;
+		} = {},
+	): Promise<{ cancelled: boolean; editorText?: string }> {
+		const response = await this.send({ type: "navigate_tree", targetId, ...options });
+		return this.getData<{ cancelled: boolean; editorText?: string }>(response);
+	}
+
+	/** Reload settings, resources, and extensions in the agent process. */
+	async reload(): Promise<void> {
+		await this.send({ type: "reload" });
+	}
+
+	/** Export the current session to a JSONL file. Returns the file path on the agent host. */
+	async exportJsonl(outputPath?: string): Promise<{ path: string }> {
+		const response = await this.send({ type: "export_jsonl", outputPath });
+		return this.getData<{ path: string }>(response);
+	}
+
+	/** Abort an in-progress compaction. */
+	async abortCompaction(): Promise<void> {
+		await this.send({ type: "abort_compaction" });
+	}
+
+	/** Abort an in-progress branch summarization. */
+	async abortBranchSummary(): Promise<void> {
+		await this.send({ type: "abort_branch_summary" });
+	}
+
+	/** Clear queued steering and follow-up messages. Returns the cleared queues. */
+	async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
+		const response = await this.send({ type: "clear_queue" });
+		return this.getData<{ steering: string[]; followUp: string[] }>(response);
+	}
+
+	/** Provider ids currently authenticated via OAuth on the agent host. */
+	async getAuthStatus(): Promise<{ oauthProviders: string[] }> {
+		const response = await this.send({ type: "get_auth_status" });
+		return this.getData<{ oauthProviders: string[] }>(response);
+	}
+
+	/** Refresh model availability (network fetch of provider catalogs). */
+	async refreshModels(): Promise<void> {
+		await this.send({ type: "refresh_models" });
+	}
+
+	/** Rename a session by file path (used by the remote session picker). */
+	async renameSession(sessionPath: string, name: string): Promise<void> {
+		await this.send({ type: "rename_session", sessionPath, name });
+	}
+
+	// =========================================================================
 	// Lifecycle
 	// =========================================================================
 
@@ -740,7 +853,7 @@ export class RpcClient {
 			}, timeout);
 
 			const unsubscribe = this.onEvent((event) => {
-				events.push(event);
+				events.push(event as AgentSessionEvent);
 				if (event.type === "agent_settled") {
 					clearTimeout(timer);
 					unsubscribe();
@@ -772,7 +885,7 @@ export class RpcClient {
 			if (this.hello) {
 				// After hello, non-JSON lines indicate protocol corruption; surface them.
 				for (const listener of this.eventListeners) {
-					listener({ type: "protocol_error", line } as unknown as AgentSessionEvent);
+					listener({ type: "protocol_error", line } as unknown as RpcServerEvent);
 				}
 			}
 			return;
@@ -802,7 +915,7 @@ export class RpcClient {
 
 			// Otherwise it's an event
 			for (const listener of this.eventListeners) {
-				listener(data as unknown as AgentSessionEvent);
+				listener(data as unknown as RpcServerEvent);
 			}
 		} catch {
 			// Ignore malformed lines

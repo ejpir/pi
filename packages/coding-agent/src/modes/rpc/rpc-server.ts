@@ -442,6 +442,15 @@ export class RpcServer {
 		});
 		// Backpressure hook is installed by the stdio adapter (output-guard);
 		// transports with their own drain handling can subscribe similarly.
+
+		// Tell attached clients the session identity changed so mirrors can
+		// refetch. Emitted after the new listeners are installed; dropped
+		// silently when no client is attached (e.g. the initial bind).
+		this.output({
+			type: "session_changed",
+			sessionId: session.sessionManager.getSessionId(),
+			cwd: session.sessionManager.getCwd(),
+		});
 	};
 
 	/** Let a transport subscribe to raw agent events (e.g. for backpressure). */
@@ -586,6 +595,10 @@ export class RpcServer {
 					isCompacting: session.isCompacting,
 					steeringMode: session.steeringMode,
 					followUpMode: session.followUpMode,
+					scopedModels: session.scopedModels.map((entry) => ({
+						model: entry.model,
+						thinkingLevel: entry.thinkingLevel,
+					})),
 					sessionFile: session.sessionFile,
 					sessionId: session.sessionId,
 					sessionName: session.sessionName,
@@ -828,6 +841,7 @@ export class RpcServer {
 						description: template.description,
 						source: "prompt",
 						sourceInfo: template.sourceInfo,
+						argumentHint: template.argumentHint,
 					});
 				}
 
@@ -841,6 +855,112 @@ export class RpcServer {
 				}
 
 				return this.success(id, "get_commands", { commands });
+			}
+
+			// =================================================================
+			// Remote-attach additions (P2)
+			// =================================================================
+
+			case "get_context_usage": {
+				return this.success(id, "get_context_usage", session.getContextUsage() ?? null);
+			}
+
+			case "get_system_prompt": {
+				return this.success(id, "get_system_prompt", { systemPrompt: session.systemPrompt });
+			}
+
+			case "get_tools": {
+				return this.success(id, "get_tools", { tools: session.getAllTools() });
+			}
+
+			case "get_resources": {
+				const resourceLoader = session.resourceLoader;
+				const extensionsResult = resourceLoader.getExtensions();
+				return this.success(id, "get_resources", {
+					skills: resourceLoader.getSkills().skills,
+					prompts: session.promptTemplates.map(({ content: _content, ...meta }) => meta),
+					themes: resourceLoader.getThemes().themes,
+					extensions: extensionsResult.extensions.map((extension) => ({
+						path: extension.path,
+						sourceInfo: extension.sourceInfo,
+						hidden: extension.hidden,
+					})),
+					extensionErrors: extensionsResult.errors,
+					agentsFiles: resourceLoader.getAgentsFiles().agentsFiles.map((agentsFile) => ({
+						path: agentsFile.path,
+					})),
+					systemPromptSource: resourceLoader.getSystemPromptSource(),
+					appendSystemPromptSources: resourceLoader.getAppendSystemPromptSources(),
+				});
+			}
+
+			case "set_scoped_models": {
+				const availableModels = await session.modelRuntime.getAvailable();
+				const scoped = command.models.map((entry) => {
+					const model = availableModels.find((m) => m.provider === entry.provider && m.id === entry.id);
+					if (!model) {
+						throw new Error(`Unknown model: ${entry.provider}/${entry.id}`);
+					}
+					return { model, thinkingLevel: entry.thinkingLevel };
+				});
+				session.setScopedModels(scoped);
+				return this.success(id, "set_scoped_models");
+			}
+
+			case "navigate_tree": {
+				const result = await session.navigateTree(command.targetId, {
+					summarize: command.summarize,
+					customInstructions: command.customInstructions,
+					replaceInstructions: command.replaceInstructions,
+					label: command.label,
+				});
+				return this.success(id, "navigate_tree", {
+					cancelled: result.cancelled,
+					editorText: result.editorText,
+				});
+			}
+
+			case "reload": {
+				await session.reload();
+				return this.success(id, "reload");
+			}
+
+			case "export_jsonl": {
+				return this.success(id, "export_jsonl", { path: session.exportToJsonl(command.outputPath) });
+			}
+
+			case "abort_compaction": {
+				session.abortCompaction();
+				return this.success(id, "abort_compaction");
+			}
+
+			case "abort_branch_summary": {
+				session.abortBranchSummary();
+				return this.success(id, "abort_branch_summary");
+			}
+
+			case "clear_queue": {
+				return this.success(id, "clear_queue", session.clearQueue());
+			}
+
+			case "get_auth_status": {
+				const modelRuntime = session.modelRuntime;
+				const oauthProviders = modelRuntime
+					.getProviders()
+					.filter((provider) => modelRuntime.isUsingOAuth(provider.id))
+					.map((provider) => provider.id);
+				return this.success(id, "get_auth_status", { oauthProviders: [...oauthProviders] });
+			}
+
+			case "refresh_models": {
+				await session.modelRuntime.refresh();
+				return this.success(id, "refresh_models");
+			}
+
+			case "rename_session": {
+				const manager = SessionManager.open(command.sessionPath);
+				manager.appendSessionInfo(command.name);
+				return this.success(id, "rename_session");
 			}
 
 			// =================================================================
