@@ -227,6 +227,17 @@ describe("RemoteAgentSession facade", () => {
 		expect(remote.model?.provider).toBe(available[0].provider);
 	});
 
+	it("modelRuntime.refresh returns the ModelsRefreshResult shape", async () => {
+		const fixture = await startFixture();
+		const { remote } = await connectFacade(fixture);
+
+		const controller = new AbortController();
+		const result = await remote.modelRuntime.refresh({ signal: controller.signal });
+		expect(result.aborted).toBe(false);
+		expect(result.errors).toBeInstanceOf(Map);
+		expect(result.errors.size).toBe(0);
+	});
+
 	it("routes extension_ui_request to the bound TUI uiContext", async () => {
 		const confirmations: Array<{ title: string; message: string }> = [];
 		const uiProbe: ExtensionFactory = (pi) => {

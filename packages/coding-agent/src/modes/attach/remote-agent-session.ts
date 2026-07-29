@@ -674,9 +674,15 @@ export class RemoteAgentSession {
 	readonly modelRuntime = {
 		getAvailable: async (): Promise<Model<any>[]> => this._availableModels as unknown as Model<any>[],
 		getAvailableSnapshot: (): Model<any>[] => this._availableModels as unknown as Model<any>[],
-		refresh: async (): Promise<void> => {
+		refresh: async (_options?: {
+			signal?: AbortSignal;
+		}): Promise<{ aborted: boolean; errors: Map<string, Error> }> => {
+			// The wire response carries no per-provider error detail (remote
+			// refresh failures surface agent-side), and a client-side abort is
+			// not forwarded — the server refresh completes regardless.
 			await this.client.refreshModels();
 			this._availableModels = await this.client.getAvailableModels().catch(() => this._availableModels);
+			return { aborted: false, errors: new Map() };
 		},
 		isUsingOAuth: (provider: string): boolean => this._oauthProviders.has(provider),
 		getModel: (provider: string, modelId: string): Model<any> | undefined =>
