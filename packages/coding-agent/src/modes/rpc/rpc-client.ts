@@ -91,7 +91,8 @@ export interface ModelInfo {
 /**
  * Events emitted by the server outside of command responses: the live
  * AgentSession event stream plus server-level lifecycle/UI events.
- * Consumers should narrow on `event.type`.
+ * Consumers should narrow on `event.type`. Additive; the legacy listener
+ * type below stays unchanged for compatibility.
  */
 export type RpcServerEvent =
 	| AgentSessionEvent
@@ -100,7 +101,7 @@ export type RpcServerEvent =
 	| RpcExtensionUIRequest
 	| RpcExtensionErrorEvent;
 
-export type RpcEventListener = (event: RpcServerEvent) => void;
+export type RpcEventListener = (event: AgentSessionEvent) => void;
 
 /** Called when the transport closes (process exit or socket close). */
 export type RpcCloseListener = (error: Error | null) => void;
@@ -558,6 +559,16 @@ export class RpcClient {
 	}
 
 	/**
+	 * Execute a bash command with a caller-chosen request id. The server's
+	 * `bash_execution_update` events carry the originating request id, so
+	 * callers can correlate streamed output chunks with this call.
+	 */
+	async bashWithId(id: string, command: string, excludeFromContext?: boolean): Promise<BashResult> {
+		const response = await this.sendWithId(id, { type: "bash", command, excludeFromContext });
+		return this.getData(response);
+	}
+
+	/**
 	 * Abort running bash command.
 	 */
 	async abortBash(): Promise<void> {
@@ -853,7 +864,7 @@ export class RpcClient {
 			}, timeout);
 
 			const unsubscribe = this.onEvent((event) => {
-				events.push(event as AgentSessionEvent);
+				events.push(event);
 				if (event.type === "agent_settled") {
 					clearTimeout(timer);
 					unsubscribe();
@@ -885,7 +896,7 @@ export class RpcClient {
 			if (this.hello) {
 				// After hello, non-JSON lines indicate protocol corruption; surface them.
 				for (const listener of this.eventListeners) {
-					listener({ type: "protocol_error", line } as unknown as RpcServerEvent);
+					listener({ type: "protocol_error", line } as unknown as AgentSessionEvent);
 				}
 			}
 			return;
@@ -915,7 +926,7 @@ export class RpcClient {
 
 			// Otherwise it's an event
 			for (const listener of this.eventListeners) {
-				listener(data as unknown as RpcServerEvent);
+				listener(data as unknown as AgentSessionEvent);
 			}
 		} catch {
 			// Ignore malformed lines
@@ -965,7 +976,10 @@ export class RpcClient {
 	}
 
 	private async send(command: RpcCommandBody): Promise<RpcResponse> {
-		const id = `req_${++this.requestId}`;
+		return this.sendWithId(`req_${++this.requestId}`, command);
+	}
+
+	private async sendWithId(id: string, command: RpcCommandBody): Promise<RpcResponse> {
 		const fullCommand = { ...command, id } as RpcCommand;
 
 		return new Promise((resolve, reject) => {
