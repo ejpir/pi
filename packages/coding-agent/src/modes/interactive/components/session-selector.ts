@@ -637,7 +637,7 @@ class SessionList implements Component, Focusable {
 	}
 }
 
-type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
+export type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
 
 /**
  * Delete a session file, trying the `trash` CLI first, then falling back to unlink

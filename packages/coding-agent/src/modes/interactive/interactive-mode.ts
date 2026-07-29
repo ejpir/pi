@@ -126,7 +126,7 @@ import {
 	OAuthSelectorComponent,
 } from "./components/oauth-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
-import { SessionSelectorComponent } from "./components/session-selector.ts";
+import { SessionSelectorComponent, type SessionsLoader } from "./components/session-selector.ts";
 import { SettingsSelectorComponent } from "./components/settings-selector.ts";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
 import {
@@ -300,6 +300,16 @@ function formatLoginProviderCompletionDescription(provider: LoginProviderComplet
 	return provider.name === provider.id ? authTypes : `${provider.name} · ${authTypes}`;
 }
 
+/** Hooks to source the /resume session picker from something other than the local filesystem. */
+export interface SessionPickerHooks {
+	/** Load sessions for the current directory (onProgress receives partial results). */
+	list: SessionsLoader;
+	/** Load sessions across all directories. */
+	listAll: SessionsLoader;
+	/** Rename a session. Defaults to opening the session file locally. */
+	renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
+}
+
 /**
  * Options for InteractiveMode initialization.
  */
@@ -318,6 +328,8 @@ export interface InteractiveModeOptions {
 	initialMessages?: string[];
 	/** Force verbose startup (overrides quietStartup setting) */
 	verbose?: boolean;
+	/** Override where the /resume session picker gets its data (e.g. remote attach). */
+	sessionPicker?: SessionPickerHooks;
 }
 
 export class InteractiveMode {
@@ -4781,13 +4793,16 @@ export class InteractiveMode {
 
 	private showSessionSelector(): void {
 		this.showSelector((done) => {
+			const picker = this.options.sessionPicker;
 			const selector = new SessionSelectorComponent(
-				(onProgress) =>
-					SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress),
-				(onProgress) =>
-					this.sessionManager.usesDefaultSessionDir()
-						? SessionManager.listAll(onProgress)
-						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress),
+				picker?.list ??
+					((onProgress) =>
+						SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress)),
+				picker?.listAll ??
+					((onProgress) =>
+						this.sessionManager.usesDefaultSessionDir()
+							? SessionManager.listAll(onProgress)
+							: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress)),
 				async (sessionPath) => {
 					done();
 					await this.handleResumeSession(sessionPath);
@@ -4801,12 +4816,14 @@ export class InteractiveMode {
 				},
 				() => this.ui.requestRender(),
 				{
-					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
-						const next = (nextName ?? "").trim();
-						if (!next) return;
-						const mgr = SessionManager.open(sessionFilePath);
-						mgr.appendSessionInfo(next);
-					},
+					renameSession:
+						picker?.renameSession ??
+						(async (sessionFilePath: string, nextName: string | undefined) => {
+							const next = (nextName ?? "").trim();
+							if (!next) return;
+							const mgr = SessionManager.open(sessionFilePath);
+							mgr.appendSessionInfo(next);
+						}),
 					showRenameHint: true,
 					keybindings: this.keybindings,
 				},
