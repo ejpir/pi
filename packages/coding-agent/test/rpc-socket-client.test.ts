@@ -4,7 +4,7 @@
  */
 
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
+import { createServer, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
@@ -213,6 +213,24 @@ describe("RpcClient over unix socket", () => {
 		// Listener is gone: a new connection is refused.
 		const probe = new RpcClient({ socketPath, helloTimeoutMs: 500 });
 		await expect(probe.start()).rejects.toThrow();
+	});
+
+	it("survives an abruptly reset client connection", async () => {
+		await startFixture();
+
+		// Connect, write partial garbage, then hard-destroy (simulates a client
+		// crash mid-write, which surfaces server-side as ECONNRESET).
+		const raw = new Socket();
+		await new Promise<void>((resolve) => raw.connect(socketPath, resolve));
+		raw.write('{"type":"get_stat');
+		raw.destroy();
+
+		// The server must still serve the next client.
+		const client = newClient();
+		await client.start();
+		expect(client.getHello()!.protocol).toBe(1);
+		const state = await client.getState();
+		expect(state.isStreaming).toBe(false);
 	});
 
 	it("requireHello fails fast against a non-RPC socket", async () => {

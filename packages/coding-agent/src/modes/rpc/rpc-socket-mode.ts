@@ -154,6 +154,10 @@ export async function createRpcSocketServer(
 	await claimSocketPath(socketPath);
 
 	listener = createServer((socket) => {
+		// Never let a misbehaving or abruptly-reset peer crash the server:
+		// 'error' (e.g. ECONNRESET) is always followed by 'close', which
+		// drives the connection-loss path in RpcServer.
+		socket.on("error", () => {});
 		rpcServer.attachConnection(createSocketConnection(socket));
 	});
 
