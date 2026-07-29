@@ -23,9 +23,10 @@ import type { PromptTemplate } from "../../core/prompt-templates.ts";
 import { buildContextEntries, type SessionEntry, type SessionTreeNode } from "../../core/session-manager.ts";
 import type { SettingsManager } from "../../core/settings-manager.ts";
 import type { Skill } from "../../core/skills.ts";
+import type { SourceInfo } from "../../core/source-info.ts";
 import type { Theme } from "../interactive/theme/theme.ts";
 import type { ModelInfo, RpcClient, RpcServerEvent } from "../rpc/rpc-client.ts";
-import type { RpcExtensionUIRequest, RpcResources } from "../rpc/rpc-types.ts";
+import type { RpcExtensionUIRequest, RpcResources, RpcSlashCommand } from "../rpc/rpc-types.ts";
 
 export interface RemoteAgentSessionOptions {
 	client: RpcClient;
@@ -72,6 +73,7 @@ export class RemoteAgentSession {
 	private _steeringMessages: string[] = [];
 	private _followUpMessages: string[] = [];
 	private _resources: RpcResources | undefined;
+	private _commands: RpcSlashCommand[] = [];
 
 	private readonly listeners = new Set<(event: AgentSessionEvent) => void>();
 	private bindings: ExtensionBindings | undefined;
@@ -681,9 +683,20 @@ export class RemoteAgentSession {
 			this._availableModels.find((m) => m.provider === provider && m.id === modelId) as unknown as
 				| Model<any>
 				| undefined,
-		getProviders: (): Array<{ id: string; name: string }> =>
-			[...new Set(this._availableModels.map((m) => m.provider))].map((id) => ({ id, name: id })),
-		getError: (): undefined => undefined,
+		getProviders: (): Array<{ id: string; name: string; auth: Record<string, never> }> =>
+			[...new Set(this._availableModels.map((m) => m.provider))].map((id) => ({ id, name: id, auth: {} })),
+		getProvider: (provider: string): { id: string; name: string; auth: Record<string, never> } | undefined =>
+			this._availableModels.some((m) => m.provider === provider)
+				? { id: provider, name: provider, auth: {} }
+				: undefined,
+		getError: (): string | undefined => undefined,
+		getProviderAuthStatus: (provider: string): { configured: boolean } => ({
+			configured: this._oauthProviders.has(provider),
+		}),
+		getAuth: (provider: string): { provider: string; oauth: boolean } | undefined =>
+			this._oauthProviders.has(provider) ? { provider, oauth: true } : undefined,
+		checkAuth: async (provider?: string): Promise<boolean> =>
+			provider ? this._oauthProviders.has(provider) : this._oauthProviders.size > 0,
 		login: async (): Promise<never> => {
 			throw new Error("OAuth login is not available over attach — authenticate on the agent host");
 		},
@@ -693,24 +706,37 @@ export class RemoteAgentSession {
 		listCredentials: async (): Promise<never> => {
 			throw new Error("Credential management is not available over attach — manage credentials on the agent host");
 		},
-		getAuth: (): undefined => undefined,
-		checkAuth: async (): Promise<undefined> => undefined,
-		getProviderAuthStatus: (): undefined => undefined,
-		getProvider: (providerId: string): { id: string; name: string } | undefined =>
-			this._availableModels.some((m) => m.provider === providerId)
-				? { id: providerId, name: providerId }
-				: undefined,
 	};
 
 	readonly extensionRunner = {
+		// Extension commands execute agent-side via session.prompt(); the TUI
+		// only needs names/metadata for autocomplete and queueing decisions.
 		getRegisteredCommands: (): Array<{
+			name: string;
 			invocationName: string;
 			description?: string;
-			sourceInfo?: unknown;
+			sourceInfo: SourceInfo;
 			getArgumentCompletions?: undefined;
-		}> => [],
+		}> =>
+			this._commands
+				.filter((c) => c.source === "extension")
+				.map((c) => ({
+					name: c.name,
+					invocationName: c.name,
+					description: c.description,
+					sourceInfo: c.sourceInfo,
+					getArgumentCompletions: undefined,
+				})),
+		getCommand: (name: string): { name: string; invocationName: string } | undefined => {
+			const found = this._commands.find((c) => c.source === "extension" && c.name === name);
+			return found ? { name: found.name, invocationName: found.name } : undefined;
+		},
+		// user_bash is emitted agent-side by the RPC bash handler (which also
+		// honours interception results), so the local pre-emit is a no-op.
+		emitUserBash: async (): Promise<undefined> => undefined,
 		getMessageRenderer: (): undefined => undefined,
 		getEntryRenderer: (): undefined => undefined,
+		getShortcuts: (): unknown[] => [],
 		getCommandDiagnostics: (): unknown[] => [],
 		getShortcutDiagnostics: (): unknown[] => [],
 		getModelRegistry: (): unknown => this.modelRuntime,
@@ -750,6 +776,7 @@ export class RemoteAgentSession {
 		reload: async (): Promise<void> => {
 			await this.client.reload();
 			this._resources = await this.client.getResources().catch(() => this._resources);
+			this._commands = await this.client.getCommands().catch(() => this._commands);
 		},
 	};
 

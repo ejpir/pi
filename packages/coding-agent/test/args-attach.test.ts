@@ -29,6 +29,12 @@ describe("attach subcommand parsing", () => {
 		expect(args.diagnostics.some((d) => d.message.includes("Unknown argument"))).toBe(true);
 	});
 
+	it("accepts --verbose", () => {
+		const args = parseArgs(["attach", "--sock", "/tmp/s", "--verbose"]);
+		expect(args.verbose).toBe(true);
+		expect(args.diagnostics).toEqual([]);
+	});
+
 	it("does not treat attach elsewhere as subcommand", () => {
 		const args = parseArgs(["--mode", "rpc"]);
 		expect(args.attach).toBeUndefined();

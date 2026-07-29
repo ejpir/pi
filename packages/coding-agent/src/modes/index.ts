@@ -16,7 +16,7 @@ export {
 } from "./interactive/interactive-mode.ts";
 export { type PrintModeOptions, runPrintMode } from "./print-mode.ts";
 export {
-	ModelInfo,
+	type ModelInfo,
 	RpcClient,
 	type RpcClientOptions,
 	type RpcCloseListener,

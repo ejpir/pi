@@ -82,6 +82,8 @@ export function parseArgs(args: string[]): Args {
 				result.attach.sock = args[++i];
 			} else if (arg === "--help" || arg === "-h") {
 				result.help = true;
+			} else if (arg === "--verbose") {
+				result.verbose = true;
 			} else {
 				result.diagnostics.push({
 					type: "error",
