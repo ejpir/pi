@@ -52,7 +52,7 @@ import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { builtInExtensions } from "./extensions/index.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
-import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
+import { InteractiveMode, runPrintMode, runRpcMode, runRpcSocketMode } from "./modes/index.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
@@ -595,6 +595,11 @@ export async function main(args: string[], options?: MainOptions) {
 		takeOverStdout();
 	}
 
+	if (parsed.sock && appMode !== "rpc") {
+		console.error(chalk.red("Error: --sock requires --mode rpc"));
+		process.exit(1);
+	}
+
 	if (parsed.mode === "rpc" && parsed.fileArgs.length > 0) {
 		console.error(chalk.red("Error: @file arguments are not supported in RPC mode"));
 		process.exit(1);
@@ -865,7 +870,10 @@ export async function main(args: string[], options?: MainOptions) {
 		void modelRuntime.refresh().catch(() => {});
 	}
 
-	if (appMode === "rpc") {
+	if (appMode === "rpc" && parsed.sock) {
+		printTimings();
+		await runRpcSocketMode(runtime, { socketPath: expandTildePath(parsed.sock!) });
+	} else if (appMode === "rpc") {
 		printTimings();
 		await runRpcMode(runtime);
 	} else if (appMode === "interactive") {

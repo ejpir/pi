@@ -36,6 +36,36 @@ This matters for clients:
 
 In particular, Node `readline` is not protocol-compliant for RPC mode because it also splits on `U+2028` and `U+2029`, which are valid inside JSON strings.
 
+### Hello Greeting
+
+The first line emitted by the server is a `hello` greeting. Clients should verify the protocol version before sending commands; until `hello` arrives, tolerate (and ignore) non-JSON lines, since transport shims (ssh banners, host-key confirmation, MOTDs) can write junk into the stream.
+
+```json
+{
+  "type": "hello",
+  "protocol": 1,
+  "version": "0.82.1",
+  "sessionId": "...",
+  "cwd": "/path/to/project",
+  "capabilities": ["shutdown", "detach", "fs_complete", "read_file", "list_sessions"]
+}
+```
+
+### Serving on a Unix Socket
+
+With `--sock`, the agent serves the identical protocol on a unix socket instead of stdio, and **outlives its clients**: clients attach, detach, and reattach while the session keeps running.
+
+```bash
+pi --mode rpc --sock ~/.pi/agent.sock
+```
+
+Socket semantics:
+- The socket file is created with `0600` permissions (only the owning user can connect).
+- A second concurrent client **takes over**: the previous client receives a `{"type": "detached", "reason": "takeover"}` event and is disconnected.
+- An explicit `detach` command ends the attachment; extension UI requests then auto-resolve immediately (headless behavior).
+- If the connection is *lost* without `detach`, pending and new extension UI requests are held for a 30s grace window and re-emitted to a reconnecting client; they auto-resolve when the window expires.
+- The `shutdown` command terminates the agent process.
+
 ## Commands
 
 ### Prompting
@@ -788,6 +818,100 @@ Response:
 
 The current session name is available via `get_state` in the `sessionName` field. To set the initial name when starting RPC mode, pass `--name <name>` or `-n <name>` to the `pi --mode rpc` process.
 
+#### list_sessions
+
+List sessions known to the agent. By default lists sessions of the agent's cwd; pass `"all": true` to list across all projects. Dates are ISO strings. Combined with `switch_session`, this enables building a remote session picker.
+
+```json
+{"type": "list_sessions"}
+```
+
+Response:
+```json
+{
+  "type": "response",
+  "command": "list_sessions",
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "path": "/home/user/.pi/agent/sessions/--project/2026-01-01_....jsonl",
+        "id": "abc123",
+        "cwd": "/path/to/project",
+        "name": "refactor auth",
+        "created": "2026-01-01T00:00:00.000Z",
+        "modified": "2026-01-02T00:00:00.000Z",
+        "messageCount": 42,
+        "firstMessage": "Help me refactor..."
+      }
+    ]
+  }
+}
+```
+
+### Lifecycle
+
+#### shutdown
+
+Terminate the agent process gracefully. The response is sent before shutdown begins; the client receives a `{"type": "detached", "reason": "shutdown"}` event afterwards.
+
+```json
+{"type": "shutdown"}
+```
+
+#### detach
+
+End the client attachment while leaving the agent running (socket mode; in stdio mode the agent exits when stdin closes regardless). Outstanding extension UI requests auto-resolve with their defaults.
+
+```json
+{"type": "detach"}
+```
+
+### Filesystem
+
+These commands execute against the **agent-side** filesystem so clients attached over a transport (socket, ssh, container exec) can offer `@file` path completion and file mentions without local filesystem access. Relative paths resolve against the session cwd. No confinement is applied — the agent-side filesystem is the security boundary.
+
+#### fs_complete
+
+Fuzzy path completion, mirroring the TUI's `@file` suggestions (fixed pruning of `.git`/`node_modules`; `.gitignore` is not consulted in v1). Returns paths relative to the session cwd.
+
+```json
+{"type": "fs_complete", "prefix": "src/comp", "limit": 100}
+```
+
+Response:
+```json
+{
+  "type": "response",
+  "command": "fs_complete",
+  "success": true,
+  "data": {
+    "entries": [
+      {"path": "src/components", "isDirectory": true},
+      {"path": "src/components/button.tsx", "isDirectory": false}
+    ]
+  }
+}
+```
+
+#### read_file
+
+Read a UTF-8 text file for file mentions. Content is capped at 1 MiB (`truncated: true`); binary files are rejected.
+
+```json
+{"type": "read_file", "path": "README.md"}
+```
+
+Response:
+```json
+{
+  "type": "response",
+  "command": "read_file",
+  "success": true,
+  "data": {"path": "/abs/path/README.md", "content": "...", "truncated": false}
+}
+```
+
 ### Commands
 
 #### get_commands
@@ -1126,6 +1250,16 @@ For branch summaries, `source` is `"branchSummary"` and no `reason` is present.
   "type": "summarization_retry_finished"
 }
 ```
+
+### detached
+
+Emitted when the server ends a client attachment (socket mode, or before a `shutdown`).
+
+```json
+{"type": "detached", "reason": "takeover"}
+```
+
+`reason` is one of `"takeover"` (another client attached), `"shutdown"` (agent terminating), or `"detach"`.
 
 ### extension_error
 

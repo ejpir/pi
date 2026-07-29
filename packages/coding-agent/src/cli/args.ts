@@ -45,6 +45,8 @@ export interface Args {
 	noContextFiles?: boolean;
 	listModels?: string | true;
 	offline?: boolean;
+	/** Unix socket path for RPC mode (agent outlives clients; detach/reattach). */
+	sock?: string;
 	verbose?: boolean;
 	projectTrustOverride?: boolean;
 	messages: string[];
@@ -80,6 +82,8 @@ export function parseArgs(args: string[]): Args {
 			if (mode === "text" || mode === "json" || mode === "rpc") {
 				result.mode = mode;
 			}
+		} else if (arg === "--sock" && i + 1 < args.length) {
+			result.sock = args[++i];
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
 		} else if (arg === "--resume" || arg === "-r") {
@@ -242,6 +246,9 @@ ${chalk.bold("Options:")}
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
+  --sock <path>                  With --mode rpc: serve the RPC protocol on a
+                                 unix socket instead of stdio. The agent outlives
+                                 clients; attach/detach/reattach are supported.
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume

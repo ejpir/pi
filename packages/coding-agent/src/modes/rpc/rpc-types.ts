@@ -70,7 +70,25 @@ export type RpcCommand =
 	| { id?: string; type: "get_messages" }
 
 	// Commands (available for invocation via prompt)
-	| { id?: string; type: "get_commands" };
+	| { id?: string; type: "get_commands" }
+
+	// Lifecycle
+	| { id?: string; type: "shutdown" }
+	| { id?: string; type: "detach" }
+
+	// Filesystem (executed against the agent-side filesystem)
+	| { id?: string; type: "fs_complete"; prefix: string; limit?: number }
+	| { id?: string; type: "read_file"; path: string }
+
+	// Sessions
+	| { id?: string; type: "list_sessions"; all?: boolean };
+
+/** Protocol version emitted in the `hello` greeting. */
+export const RPC_PROTOCOL_VERSION = 1;
+
+/** Optional capabilities advertised in `hello` (command types beyond the baseline). */
+export const RPC_CAPABILITIES = ["shutdown", "detach", "fs_complete", "read_file", "list_sessions"] as const;
+export type RpcCapability = (typeof RPC_CAPABILITIES)[number];
 
 // ============================================================================
 // RPC Slash Command (for get_commands response)
@@ -227,8 +245,74 @@ export type RpcResponse =
 			data: { commands: RpcSlashCommand[] };
 	  }
 
+	// Lifecycle
+	| { id?: string; type: "response"; command: "shutdown"; success: true }
+	| { id?: string; type: "response"; command: "detach"; success: true }
+
+	// Filesystem
+	| {
+			id?: string;
+			type: "response";
+			command: "fs_complete";
+			success: true;
+			data: { entries: Array<{ path: string; isDirectory: boolean }> };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "read_file";
+			success: true;
+			data: { path: string; content: string; truncated: boolean };
+	  }
+
+	// Sessions
+	| {
+			id?: string;
+			type: "response";
+			command: "list_sessions";
+			success: true;
+			data: { sessions: RpcSessionInfo[] };
+	  }
+
 	// Error response (any command can fail)
 	| { id?: string; type: "response"; command: string; success: false; error: string };
+
+// ============================================================================
+// RPC Server Events (stdout, not tied to a command)
+// ============================================================================
+
+/**
+ * First line emitted when a client attaches. Clients should verify
+ * `protocol` before sending commands.
+ */
+export interface RpcHello {
+	type: "hello";
+	protocol: number;
+	/** pi version string */
+	version: string;
+	sessionId: string;
+	cwd: string;
+	capabilities: string[];
+}
+
+/** Emitted when the server ends a client attachment (e.g. another client took over). */
+export interface RpcDetachedEvent {
+	type: "detached";
+	reason: "takeover" | "shutdown" | "detach";
+}
+
+/** Serializable form of SessionInfo (dates as ISO strings). */
+export interface RpcSessionInfo {
+	path: string;
+	id: string;
+	cwd: string;
+	name?: string;
+	parentSessionPath?: string;
+	created: string;
+	modified: string;
+	messageCount: number;
+	firstMessage: string;
+}
 
 // ============================================================================
 // Extension UI Events (stdout)
