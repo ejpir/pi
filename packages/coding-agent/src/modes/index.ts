@@ -2,7 +2,18 @@
  * Run modes for the coding agent.
  */
 
-export { InteractiveMode, type InteractiveModeOptions } from "./interactive/interactive-mode.ts";
+export { type AttachModeOptions, runAttachMode } from "./attach/attach-mode.ts";
+export { RemoteAgentSession, type RemoteAgentSessionOptions } from "./attach/remote-agent-session.ts";
+export {
+	asAgentSessionRuntime,
+	RemoteAgentSessionRuntime,
+	type RemoteRuntimeOptions,
+} from "./attach/remote-runtime.ts";
+export {
+	InteractiveMode,
+	type InteractiveModeOptions,
+	type SessionPickerHooks,
+} from "./interactive/interactive-mode.ts";
 export { type PrintModeOptions, runPrintMode } from "./print-mode.ts";
 export {
 	ModelInfo,

@@ -10,6 +10,8 @@ import type { ExtensionFlag } from "../core/extensions/types.ts";
 export type Mode = "text" | "json" | "rpc";
 
 export interface Args {
+	/** Remote attach subcommand: connect the interactive TUI to an agent over RPC. */
+	attach?: { command?: string; sock?: string };
 	provider?: string;
 	model?: string;
 	apiKey?: string;
@@ -69,6 +71,32 @@ export function parseArgs(args: string[]): Args {
 		unknownFlags: new Map(),
 		diagnostics: [],
 	};
+
+	if (args[0] === "attach") {
+		result.attach = {};
+		for (let i = 1; i < args.length; i++) {
+			const arg = args[i];
+			if (arg === "--cmd" && i + 1 < args.length) {
+				result.attach.command = args[++i];
+			} else if (arg === "--sock" && i + 1 < args.length) {
+				result.attach.sock = args[++i];
+			} else if (arg === "--help" || arg === "-h") {
+				result.help = true;
+			} else {
+				result.diagnostics.push({
+					type: "error",
+					message: `Unknown argument for attach: ${arg}`,
+				});
+			}
+		}
+		if (!result.help && !result.attach.command && !result.attach.sock) {
+			result.diagnostics.push({ type: "error", message: "attach requires --cmd <command> or --sock <path>" });
+		}
+		if (result.attach.command && result.attach.sock) {
+			result.diagnostics.push({ type: "error", message: "attach: --cmd and --sock are mutually exclusive" });
+		}
+		return result;
+	}
 
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
