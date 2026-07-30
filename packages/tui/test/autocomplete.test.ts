@@ -55,6 +55,30 @@ const getSuggestions = (
 ) => provider.getSuggestions(lines, cursorLine, cursorCol, { signal: new AbortController().signal, force });
 
 describe("CombinedAutocompleteProvider", () => {
+	describe("fileSearcher", () => {
+		it("uses a custom file searcher for @-completion instead of fd", async () => {
+			const calls: string[] = [];
+			const provider = new CombinedAutocompleteProvider([], "/nonexistent-base", null, async (query) => {
+				calls.push(query);
+				return [
+					{ path: "src/main.go", isDirectory: false },
+					{ path: "src", isDirectory: true },
+				];
+			});
+			const result = await getSuggestions(provider, ["@mai"], 0, 4);
+			assert.notEqual(result, null, "custom searcher should produce suggestions");
+			assert.deepEqual(calls, ["mai"]);
+			const labels = result!.items.map((item) => item.label);
+			assert.ok(labels.includes("main.go"), `expected main.go in ${labels}`);
+		});
+
+		it("returns null when the custom searcher yields nothing", async () => {
+			const provider = new CombinedAutocompleteProvider([], "/nonexistent-base", null, async () => []);
+			const result = await getSuggestions(provider, ["@zzz"], 0, 4);
+			assert.strictEqual(result, null);
+		});
+	});
+
 	describe("extractPathPrefix", () => {
 		it("extracts / from 'hey /' when forced", async () => {
 			const provider = new CombinedAutocompleteProvider([], "/tmp");

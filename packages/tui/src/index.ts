@@ -2,6 +2,7 @@
 
 // Autocomplete support
 export {
+	type AutocompleteFileSearcher,
 	type AutocompleteItem,
 	type AutocompleteProvider,
 	type AutocompleteSuggestions,

@@ -23,6 +23,7 @@ import type {
 	Terminal,
 } from "@earendil-works/pi-tui";
 import {
+	type AutocompleteFileSearcher,
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
@@ -340,6 +341,8 @@ export interface InteractiveModeOptions {
 	alt?: boolean;
 	/** Override where the /resume session picker gets its data (e.g. remote attach). */
 	sessionPicker?: SessionPickerHooks;
+	/** Custom @-file completion source (e.g. RPC fs_complete against a remote agent). */
+	fileCompletion?: AutocompleteFileSearcher;
 }
 
 interface InteractiveTuiOptions {
@@ -667,6 +670,7 @@ export class InteractiveMode {
 			[...slashCommands, ...templateCommands, ...extensionCommands, ...skillCommandList],
 			this.sessionManager.getCwd(),
 			this.fdPath,
+			this.options.fileCompletion ?? null,
 		);
 	}
 

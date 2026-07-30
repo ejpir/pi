@@ -174,6 +174,17 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 
 	const interactive = new InteractiveMode(asAgentSessionRuntime(runtime), {
 		sessionPicker,
+		// @-completion queries the AGENT's filesystem over fs_complete —
+		// the agent's cwd (e.g. /work in a container) usually doesn't exist
+		// on the attach host, so the default fd walker finds nothing there.
+		fileCompletion: async (query, { signal }) => {
+			try {
+				const entries = await client.fsComplete(query);
+				return signal.aborted ? [] : entries;
+			} catch {
+				return [];
+			}
+		},
 		verbose: options.verbose,
 	});
 	interactiveRef = interactive;
