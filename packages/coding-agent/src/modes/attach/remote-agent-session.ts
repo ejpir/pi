@@ -318,23 +318,16 @@ export class RemoteAgentSession {
 				break;
 			case "message_end":
 				if (e.message) {
+					// Replay hazard, drain-only: messages that completed while a
+					// refetch was in flight are already in the fresh snapshot,
+					// so queued message_ends replaying on top would double-render
+					// them. Matching is EXACT (role + ms timestamp + serialized
+					// content) — a replay is byte-identical to its snapshot copy,
+					// so a genuinely new message can never false-positive, and a
+					// whole-array scan covers several messages completing within
+					// one refetch window. Never apply outside the drain window.
 					const message = e.message as AgentMessage;
-					// Replay hazard, drain-only: a message that completed while a
-					// refetch was in flight is already in the fresh snapshot, so a
-					// queued message_end replaying on top would double-render it.
-					// role+timestamp identity is NOT unique across live traffic
-					// (same-millisecond toolResults from back-to-back tool calls
-					// exist) — never apply this outside the drain window.
-					const last = this._messages[this._messages.length - 1] as
-						| { role?: string; timestamp?: number }
-						| undefined;
-					const incoming = message as { role?: string; timestamp?: number };
-					if (
-						!this._drainingPending ||
-						!last ||
-						last.role !== incoming.role ||
-						last.timestamp !== incoming.timestamp
-					) {
+					if (!this._drainingPending || !this.isMirroredMessage(message)) {
 						this._messages.push(message);
 					}
 				}
@@ -372,6 +365,20 @@ export class RemoteAgentSession {
 				this.mirror.sessionName = e.name as string | undefined;
 				break;
 		}
+	}
+
+	/** Drain-only replay check: is this exact message already in the mirror? */
+	private isMirroredMessage(message: AgentMessage): boolean {
+		const incoming = message as { role?: string; timestamp?: number };
+		const serialized = JSON.stringify(message);
+		return this._messages.some((existing) => {
+			const candidate = existing as { role?: string; timestamp?: number };
+			return (
+				candidate.role === incoming.role &&
+				candidate.timestamp === incoming.timestamp &&
+				JSON.stringify(existing) === serialized
+			);
+		});
 	}
 
 	private emit(event: AgentSessionEvent): void {

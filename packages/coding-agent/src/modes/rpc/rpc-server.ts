@@ -109,6 +109,8 @@ export class RpcServer {
 	private agentEventUnsubscribe: (() => void) | undefined;
 	private shutdownRequested = false;
 	private readonly refreshTimeoutMs: number;
+	/** Coalesces concurrent refresh_models calls onto one agent-side refresh. */
+	private pendingModelRefresh: Promise<unknown> | undefined;
 	private shuttingDown = false;
 	private detachGraceMs: number;
 	private runtimeHost: AgentSessionRuntime;
@@ -1034,13 +1036,18 @@ export class RpcServer {
 			}
 
 			case "refresh_models": {
-				// Bound the wait (see refreshTimeoutMs): a hung registry fetch
-				// must not jam the sequential command queue. The refresh keeps
-				// running in the background and lands whenever it settles.
+				// Coalesce onto ONE agent-side refresh: a retrying client must
+				// not stack refreshes. Bound the wait (see refreshTimeoutMs):
+				// a hung registry fetch must not jam the sequential command
+				// queue — the refresh keeps running in the background either
+				// way and lands whenever it settles.
+				this.pendingModelRefresh ??= session.modelRuntime.refresh().finally(() => {
+					this.pendingModelRefresh = undefined;
+				});
 				let timer: NodeJS.Timeout | undefined;
 				try {
 					await Promise.race([
-						session.modelRuntime.refresh(),
+						this.pendingModelRefresh,
 						new Promise<void>((resolve) => {
 							timer = setTimeout(resolve, this.refreshTimeoutMs);
 						}),

@@ -493,28 +493,28 @@ export class RpcClient {
 	 * Use waitForIdle() to wait for completion.
 	 */
 	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "prompt", message, images });
+		await this.sendChecked({ type: "prompt", message, images });
 	}
 
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "steer", message, images });
+		await this.sendChecked({ type: "steer", message, images });
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
 	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "follow_up", message, images });
+		await this.sendChecked({ type: "follow_up", message, images });
 	}
 
 	/**
 	 * Abort current operation.
 	 */
 	async abort(): Promise<void> {
-		await this.send({ type: "abort" });
+		await this.sendChecked({ type: "abort" });
 	}
 
 	/**
@@ -567,7 +567,7 @@ export class RpcClient {
 	 * Set thinking level.
 	 */
 	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
-		await this.send({ type: "set_thinking_level", level });
+		await this.sendChecked({ type: "set_thinking_level", level });
 	}
 
 	/**
@@ -590,14 +590,14 @@ export class RpcClient {
 	 * Set steering mode.
 	 */
 	async setSteeringMode(mode: "all" | "one-at-a-time"): Promise<void> {
-		await this.send({ type: "set_steering_mode", mode });
+		await this.sendChecked({ type: "set_steering_mode", mode });
 	}
 
 	/**
 	 * Set follow-up mode.
 	 */
 	async setFollowUpMode(mode: "all" | "one-at-a-time"): Promise<void> {
-		await this.send({ type: "set_follow_up_mode", mode });
+		await this.sendChecked({ type: "set_follow_up_mode", mode });
 	}
 
 	/**
@@ -612,21 +612,21 @@ export class RpcClient {
 	 * Set auto-compaction enabled/disabled.
 	 */
 	async setAutoCompaction(enabled: boolean): Promise<void> {
-		await this.send({ type: "set_auto_compaction", enabled });
+		await this.sendChecked({ type: "set_auto_compaction", enabled });
 	}
 
 	/**
 	 * Set auto-retry enabled/disabled.
 	 */
 	async setAutoRetry(enabled: boolean): Promise<void> {
-		await this.send({ type: "set_auto_retry", enabled });
+		await this.sendChecked({ type: "set_auto_retry", enabled });
 	}
 
 	/**
 	 * Abort in-progress retry.
 	 */
 	async abortRetry(): Promise<void> {
-		await this.send({ type: "abort_retry" });
+		await this.sendChecked({ type: "abort_retry" });
 	}
 
 	/**
@@ -652,7 +652,7 @@ export class RpcClient {
 	 * Abort running bash command.
 	 */
 	async abortBash(): Promise<void> {
-		await this.send({ type: "abort_bash" });
+		await this.sendChecked({ type: "abort_bash" });
 	}
 
 	/**
@@ -734,7 +734,7 @@ export class RpcClient {
 	 * Set the session display name.
 	 */
 	async setSessionName(name: string): Promise<void> {
-		await this.send({ type: "set_session_name", name });
+		await this.sendChecked({ type: "set_session_name", name });
 	}
 
 	/**
@@ -785,7 +785,7 @@ export class RpcClient {
 	async setScopedModels(
 		models: Array<{ provider: string; id: string; thinkingLevel?: ThinkingLevel }>,
 	): Promise<void> {
-		await this.send({ type: "set_scoped_models", models });
+		await this.sendChecked({ type: "set_scoped_models", models });
 	}
 
 	/**
@@ -807,7 +807,7 @@ export class RpcClient {
 
 	/** Reload settings, resources, and extensions in the agent process. */
 	async reload(): Promise<void> {
-		await this.send({ type: "reload" });
+		await this.sendChecked({ type: "reload" });
 	}
 
 	/** Export the current session to a JSONL file. Returns the file path on the agent host. */
@@ -818,12 +818,12 @@ export class RpcClient {
 
 	/** Abort an in-progress compaction. */
 	async abortCompaction(): Promise<void> {
-		await this.send({ type: "abort_compaction" });
+		await this.sendChecked({ type: "abort_compaction" });
 	}
 
 	/** Abort an in-progress branch summarization. */
 	async abortBranchSummary(): Promise<void> {
-		await this.send({ type: "abort_branch_summary" });
+		await this.sendChecked({ type: "abort_branch_summary" });
 	}
 
 	/** Clear queued steering and follow-up messages. Returns the cleared queues. */
@@ -888,15 +888,12 @@ export class RpcClient {
 		// a wider budget than the 30s default. The server additionally
 		// bounds the refresh itself (refreshTimeoutMs), so this mostly
 		// covers a congested command queue.
-		const response = await this.sendWithId(`req_${++this.requestId}`, { type: "refresh_models" }, 180_000);
-		if (!response.success) {
-			throw new Error(response.error ?? "refresh_models failed");
-		}
+		this.getData(await this.sendWithId(`req_${++this.requestId}`, { type: "refresh_models" }, 180_000));
 	}
 
 	/** Rename a session by file path (used by the remote session picker). */
 	async renameSession(sessionPath: string, name: string): Promise<void> {
-		await this.send({ type: "rename_session", sessionPath, name });
+		await this.sendChecked({ type: "rename_session", sessionPath, name });
 	}
 
 	// =========================================================================
@@ -1110,6 +1107,16 @@ export class RpcClient {
 
 	private async send(command: RpcCommandBody): Promise<RpcResponse> {
 		return this.sendWithId(`req_${++this.requestId}`, command);
+	}
+
+	/**
+	 * Send a void command and throw its error response. getData() only
+	 * guards methods that read a payload — a bare `await this.send(...)`
+	 * silently discards `success: false`, making e.g. a failed rename look
+	 * successful in the session picker.
+	 */
+	private async sendChecked(command: RpcCommandBody): Promise<void> {
+		this.getData(await this.send(command));
 	}
 
 	private async sendWithId(id: string, command: RpcCommandBody, timeoutMs = 30_000): Promise<RpcResponse> {

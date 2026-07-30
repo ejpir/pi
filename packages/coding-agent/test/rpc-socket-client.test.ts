@@ -277,7 +277,11 @@ process.stdout.write(
 		await startFixture({ refreshTimeoutMs: 200 });
 		// Make the agent-side catalog refresh hang forever.
 		const rt = session!.modelRuntime as unknown as { refresh: () => Promise<unknown> };
-		rt.refresh = () => new Promise(() => {});
+		let refreshCalls = 0;
+		rt.refresh = () => {
+			refreshCalls++;
+			return new Promise(() => {});
+		};
 
 		const client = newClient();
 		await client.start();
@@ -288,6 +292,18 @@ process.stdout.write(
 		// The sequential queue is not jammed behind the still-hung refresh.
 		const state = await client.getState();
 		expect(state.sessionId).toBeTruthy();
+		// A retry coalesces onto the in-flight refresh instead of stacking.
+		await client.refreshModels();
+		expect(refreshCalls).toBe(1);
+	});
+
+	it("void commands surface error responses instead of swallowing them", async () => {
+		await startFixture();
+		const client = newClient();
+		await client.start();
+		// The server rejects an empty session name; a bare-send client would
+		// report success to the session picker.
+		await expect(client.setSessionName("")).rejects.toThrow(/cannot be empty/i);
 	});
 
 	it("shutdown command terminates the server and closes the client", async () => {

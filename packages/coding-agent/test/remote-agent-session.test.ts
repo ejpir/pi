@@ -11,7 +11,7 @@ import { type AssistantMessage, type AssistantMessageEvent, EventStream, getMode
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
-import { SessionImportFileNotFoundError } from "../src/core/agent-session-runtime.ts";
+import { SessionImportFileNotFoundError, SessionImportUnsupportedError } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { MissingSessionCwdError } from "../src/core/session-cwd.ts";
@@ -439,6 +439,44 @@ describe("RemoteAgentSession facade", () => {
 		expect(error).not.toBeInstanceOf(SessionImportFileNotFoundError);
 	});
 
+	it("reports wire import failures as unsupported instead of hitting the fatal path", async () => {
+		// The stock import handler routes unclassified errors to
+		// handleFatalRuntimeError (process.exit) — over the wire that would
+		// kill the attach for a recoverable condition.
+		const fixtureA = await startFixture({ suffix: "import-wireerr", persisted: true });
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+
+		const uploadPath = join(fixtureA.tempDir, "wire-err.jsonl");
+		writeFileSync(uploadPath, "{}\n", "utf8");
+		vi.spyOn(client, "importSession").mockRejectedValue(new Error("Unknown command: import_session"));
+
+		const error = await runtime.importFromJsonl(uploadPath).catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(SessionImportUnsupportedError);
+		expect((error as Error).message).toContain("Unknown command: import_session");
+	});
+
+	it("pre-flights the import_session capability with an actionable message", async () => {
+		const fixtureA = await startFixture({ suffix: "import-cap", persisted: true });
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+		vi.spyOn(client, "hasCapability").mockReturnValue(false);
+
+		const error = await runtime.importFromJsonl("whatever.jsonl").catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(SessionImportUnsupportedError);
+		expect((error as Error).message).toMatch(/does not support \/import/);
+	});
+
 	it("rejects agent-side files too large to read over the wire", async () => {
 		const fixtureA = await startFixture({ suffix: "import-trunc", persisted: true });
 		const { client, remote, settingsManager } = await connectFacade(fixtureA);
@@ -486,6 +524,31 @@ describe("RemoteAgentSession facade", () => {
 		// Replaying the same terminal event while draining the post-refetch
 		// queue (same role+timestamp) must not push a duplicate.
 		mirror._drainingPending = true;
+		mirror.applyMirror({ type: "message_end", message: last });
+		mirror._drainingPending = false;
+		expect(mirror._messages.length).toBe(before);
+	});
+
+	it("dedups several messages replayed from one refetch window", async () => {
+		// Two messages completing during a single refetch are BOTH in the
+		// fresh snapshot; draining their queued message_ends must skip both
+		// (exact match against the whole mirror, not just the tail).
+		const fixture = await startFixture({ suffix: "msg-dedup2", persisted: true });
+		await fixture.session.prompt("first");
+		await fixture.session.prompt("second");
+		const { remote } = await connectFacade(fixture);
+
+		const mirror = remote as unknown as {
+			applyMirror: (event: unknown) => void;
+			_messages: unknown[];
+			_drainingPending: boolean;
+		};
+		const before = mirror._messages.length;
+		expect(before).toBeGreaterThan(1);
+		const [secondLast, last] = mirror._messages.slice(-2);
+
+		mirror._drainingPending = true;
+		mirror.applyMirror({ type: "message_end", message: secondLast });
 		mirror.applyMirror({ type: "message_end", message: last });
 		mirror._drainingPending = false;
 		expect(mirror._messages.length).toBe(before);

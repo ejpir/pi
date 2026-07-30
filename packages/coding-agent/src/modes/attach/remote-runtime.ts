@@ -12,7 +12,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { basename } from "node:path";
 import type { AgentSession } from "../../core/agent-session.ts";
-import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
+import {
+	type AgentSessionRuntime,
+	SessionImportFileNotFoundError,
+	SessionImportUnsupportedError,
+} from "../../core/agent-session-runtime.ts";
 import type { AgentSessionServices } from "../../core/agent-session-services.ts";
 import type { ModelRuntime } from "../../core/model-runtime.ts";
 import type { ResourceLoader } from "../../core/resource-loader.ts";
@@ -125,6 +129,14 @@ export class RemoteAgentSessionRuntime {
 	 * lands the TUI on the imported session.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		// Pre-flight: an agent running an older build (e.g. a stale baked
+		// container image) lacks import_session — say so plainly instead of
+		// surfacing the wire's "Unknown command" error.
+		if (!this.client.hasCapability("import_session")) {
+			throw new SessionImportUnsupportedError(
+				"The attached agent does not support /import (missing import_session capability) — update or rebuild the agent image",
+			);
+		}
 		const clientPath = resolvePath(inputPath, process.cwd());
 		let content: string;
 		let fileName: string;
@@ -168,7 +180,20 @@ export class RemoteAgentSessionRuntime {
 			);
 		}
 
-		const result = await this.client.importSession({ content, fileName, cwdOverride });
+		let result: {
+			cancelled: boolean;
+			missingCwd?: { sessionFile?: string; sessionCwd: string; fallbackCwd: string };
+		};
+		try {
+			result = await this.client.importSession({ content, fileName, cwdOverride });
+		} catch (error) {
+			// The stock import handler routes unclassified errors to
+			// handleFatalRuntimeError (process.exit) — survivable locally,
+			// but over the wire a transport timeout or an agent-side failure
+			// must not kill the attach. Report as unsupported: the TUI shows
+			// the message and stays alive.
+			throw new SessionImportUnsupportedError(error instanceof Error ? error.message : String(error));
+		}
 		if (result.missingCwd) {
 			// Reconstruct the typed error so the TUI's stock retry flow
 			// (prompt for a cwd, retry with cwdOverride) works unchanged.
