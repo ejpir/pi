@@ -456,6 +456,19 @@ describe("RemoteAgentSession facade", () => {
 		expect((error as Error).message).toMatch(/too large/i);
 	});
 
+	it("modelRuntime.refresh absorbs wire failures into the errors map", async () => {
+		// The stock TUI awaits refresh() uncaught in showModelsSelector — a
+		// wire failure (e.g. a bounded-out agent-side catalog fetch) must
+		// surface via the errors map, never as a rejection.
+		const fixture = await startFixture({ suffix: "refresh-err" });
+		const { client, remote } = await connectFacade(fixture);
+		vi.spyOn(client, "refreshModels").mockRejectedValue(new Error("boom"));
+
+		const result = await remote.modelRuntime.refresh();
+		expect(result.aborted).toBe(false);
+		expect(result.errors.get("*")?.message).toBe("boom");
+	});
+
 	it("dedups a message_end replayed over a refetched snapshot", async () => {
 		const fixture = await startFixture({ suffix: "msg-dedup", persisted: true });
 		await fixture.session.prompt("dedup check");
@@ -464,22 +477,46 @@ describe("RemoteAgentSession facade", () => {
 		const mirror = remote as unknown as {
 			applyMirror: (event: unknown) => void;
 			_messages: unknown[];
+			_drainingPending: boolean;
 		};
 		const before = mirror._messages.length;
 		expect(before).toBeGreaterThan(0);
 		const last = mirror._messages[before - 1];
 
-		// Replaying the same terminal event (same role+timestamp, as a queued
-		// event drained after a refetch would) must not push a duplicate.
+		// Replaying the same terminal event while draining the post-refetch
+		// queue (same role+timestamp) must not push a duplicate.
+		mirror._drainingPending = true;
 		mirror.applyMirror({ type: "message_end", message: last });
+		mirror._drainingPending = false;
 		expect(mirror._messages.length).toBe(before);
+	});
 
-		// A genuinely new message still lands.
-		mirror.applyMirror({
-			type: "message_end",
-			message: { role: "user", content: "later", timestamp: Date.now() + 60_000 },
+	it("keeps same-millisecond messages arriving outside a refetch drain", async () => {
+		// The drain-window dedup must NEVER fire on live traffic: two
+		// back-to-back tool calls can produce toolResult messages with the
+		// same role AND the same Date.now() millisecond.
+		const fixture = await startFixture({ suffix: "msg-live", persisted: true });
+		await fixture.session.prompt("live check");
+		const { remote } = await connectFacade(fixture);
+
+		const mirror = remote as unknown as {
+			applyMirror: (event: unknown) => void;
+			_messages: unknown[];
+		};
+		const before = mirror._messages.length;
+		const ts = Date.now();
+		const toolResult = (id: string) => ({
+			role: "toolResult",
+			toolCallId: id,
+			toolName: "read",
+			content: [],
+			details: {},
+			isError: false,
+			timestamp: ts,
 		});
-		expect(mirror._messages.length).toBe(before + 1);
+		mirror.applyMirror({ type: "message_end", message: toolResult("call-1") });
+		mirror.applyMirror({ type: "message_end", message: toolResult("call-2") });
+		expect(mirror._messages.length).toBe(before + 2);
 	});
 
 	it("maps missingCwd over the wire back to MissingSessionCwdError", async () => {

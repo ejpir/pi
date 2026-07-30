@@ -62,7 +62,7 @@ describe("RpcClient over unix socket", () => {
 	let session: AgentSession | undefined;
 	const clients: RpcClient[] = [];
 
-	async function startFixture(): Promise<void> {
+	async function startFixture(options: { refreshTimeoutMs?: number } = {}): Promise<void> {
 		tempDir = join(tmpdir(), `pi-rpc-sock-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 		writeFileSync(join(tempDir, "socket-test.txt"), "socket round trip\n");
@@ -108,7 +108,10 @@ describe("RpcClient over unix socket", () => {
 			setRebindSession: vi.fn(),
 		} as unknown as AgentSessionRuntime;
 
-		socketServer = await createRpcSocketServer(runtimeHost, { socketPath });
+		socketServer = await createRpcSocketServer(runtimeHost, {
+			socketPath,
+			refreshTimeoutMs: options.refreshTimeoutMs,
+		});
 	}
 
 	function newClient(): RpcClient {
@@ -268,6 +271,23 @@ process.stdout.write(
 
 		await vi.waitFor(() => expect(saw).toContain("second:detached"));
 		expect(saw).toContain("thrower");
+	});
+
+	it("a hung agent-side model refresh is bounded and does not jam the queue", async () => {
+		await startFixture({ refreshTimeoutMs: 200 });
+		// Make the agent-side catalog refresh hang forever.
+		const rt = session!.modelRuntime as unknown as { refresh: () => Promise<unknown> };
+		rt.refresh = () => new Promise(() => {});
+
+		const client = newClient();
+		await client.start();
+		const started = Date.now();
+		// The server answers once its bound lapses, not when the refresh settles.
+		await client.refreshModels();
+		expect(Date.now() - started).toBeLessThan(10_000);
+		// The sequential queue is not jammed behind the still-hung refresh.
+		const state = await client.getState();
+		expect(state.sessionId).toBeTruthy();
 	});
 
 	it("shutdown command terminates the server and closes the client", async () => {

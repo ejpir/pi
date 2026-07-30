@@ -68,6 +68,15 @@ export interface RpcServerOptions {
 	connectionLoss: "shutdown" | "grace";
 	/** Grace window for connection loss. Default 30s. Only for "grace" mode. */
 	detachGraceMs?: number;
+	/**
+	 * Max time the refresh_models handler awaits the agent-side catalog
+	 * refresh before responding anyway. The command queue is sequential and
+	 * registry fetches can hang for minutes on networks the agent's proxy
+	 * config doesn't cover — the bound keeps one slow refresh from jamming
+	 * every subsequent command. The refresh keeps running in the
+	 * background; its result lands whenever it settles. Default 60s.
+	 */
+	refreshTimeoutMs?: number;
 	/** Terminate the process/server. Called once on shutdown. */
 	onShutdown: (exitCode: number) => void | Promise<void>;
 }
@@ -99,12 +108,14 @@ export class RpcServer {
 	private agentEventListeners = new Set<() => void | Promise<void>>();
 	private agentEventUnsubscribe: (() => void) | undefined;
 	private shutdownRequested = false;
+	private readonly refreshTimeoutMs: number;
 	private shuttingDown = false;
 	private detachGraceMs: number;
 	private runtimeHost: AgentSessionRuntime;
 	private options: RpcServerOptions;
 
 	constructor(runtimeHost: AgentSessionRuntime, options: RpcServerOptions) {
+		this.refreshTimeoutMs = options.refreshTimeoutMs ?? 60_000;
 		this.runtimeHost = runtimeHost;
 		this.options = options;
 		this.session = runtimeHost.session;
@@ -1023,7 +1034,20 @@ export class RpcServer {
 			}
 
 			case "refresh_models": {
-				await session.modelRuntime.refresh();
+				// Bound the wait (see refreshTimeoutMs): a hung registry fetch
+				// must not jam the sequential command queue. The refresh keeps
+				// running in the background and lands whenever it settles.
+				let timer: NodeJS.Timeout | undefined;
+				try {
+					await Promise.race([
+						session.modelRuntime.refresh(),
+						new Promise<void>((resolve) => {
+							timer = setTimeout(resolve, this.refreshTimeoutMs);
+						}),
+					]);
+				} finally {
+					clearTimeout(timer);
+				}
 				return this.success(id, "refresh_models");
 			}
 

@@ -22,6 +22,8 @@ export interface RpcSocketModeOptions {
 	socketPath: string;
 	/** Grace window for connection loss before UI requests auto-resolve. */
 	detachGraceMs?: number;
+	/** Bound for the agent-side model-catalog refresh (see RpcServerOptions). */
+	refreshTimeoutMs?: number;
 	/**
 	 * Called after server-initiated shutdown (shutdown command, extension
 	 * shutdown request) once the listener is closed. runRpcSocketMode uses
@@ -163,6 +165,7 @@ export async function createRpcSocketServer(
 	const rpcServer = new RpcServer(runtimeHost, {
 		connectionLoss: "grace",
 		detachGraceMs: options.detachGraceMs,
+		refreshTimeoutMs: options.refreshTimeoutMs,
 		onShutdown: async (exitCode) => {
 			await close();
 			await options.onShutdown?.(exitCode);

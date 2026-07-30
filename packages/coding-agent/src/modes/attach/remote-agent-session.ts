@@ -140,8 +140,18 @@ export class RemoteAgentSession {
 			if (this._refetching === 0) {
 				const queued = this._pendingEvents;
 				this._pendingEvents = [];
-				for (const event of queued) {
-					this.routeEvent(event);
+				// Dedup heuristics in applyMirror apply ONLY while draining this
+				// queue — they guard against replaying state the refetched
+				// snapshot already contains. They are unsafe against live
+				// traffic (role+timestamp is not unique across same-millisecond
+				// messages), so the flag must scope them tightly.
+				this._drainingPending = true;
+				try {
+					for (const event of queued) {
+						this.routeEvent(event);
+					}
+				} finally {
+					this._drainingPending = false;
 				}
 			}
 		}
@@ -221,6 +231,7 @@ export class RemoteAgentSession {
 	>();
 	private _authRequestCounter = 0;
 	private _pendingEvents: RpcServerEvent[] = [];
+	private _drainingPending = false;
 
 	private routeEvent(event: RpcServerEvent): void {
 		if (this._refetching > 0) {
@@ -308,16 +319,22 @@ export class RemoteAgentSession {
 			case "message_end":
 				if (e.message) {
 					const message = e.message as AgentMessage;
-					// Same replay hazard as entry_appended below: a message that
-					// completed while a refetch was in flight is already in the
-					// fresh snapshot — replaying its queued message_end would
-					// double-render it. Messages carry ms timestamps, so
-					// role+timestamp identity is sufficient here.
+					// Replay hazard, drain-only: a message that completed while a
+					// refetch was in flight is already in the fresh snapshot, so a
+					// queued message_end replaying on top would double-render it.
+					// role+timestamp identity is NOT unique across live traffic
+					// (same-millisecond toolResults from back-to-back tool calls
+					// exist) — never apply this outside the drain window.
 					const last = this._messages[this._messages.length - 1] as
 						| { role?: string; timestamp?: number }
 						| undefined;
 					const incoming = message as { role?: string; timestamp?: number };
-					if (!last || last.role !== incoming.role || last.timestamp !== incoming.timestamp) {
+					if (
+						!this._drainingPending ||
+						!last ||
+						last.role !== incoming.role ||
+						last.timestamp !== incoming.timestamp
+					) {
 						this._messages.push(message);
 					}
 				}
@@ -862,12 +879,21 @@ export class RemoteAgentSession {
 		refresh: async (_options?: {
 			signal?: AbortSignal;
 		}): Promise<{ aborted: boolean; errors: Map<string, Error> }> => {
-			// The wire response carries no per-provider error detail (remote
-			// refresh failures surface agent-side), and a client-side abort is
-			// not forwarded — the server refresh completes regardless.
-			await this.client.refreshModels();
-			this._availableModels = await this.client.getAvailableModels().catch(() => this._availableModels);
-			return { aborted: false, errors: new Map() };
+			// Refresh is best-effort over the wire and must NEVER reject: the
+			// stock TUI awaits it uncaught (showModelsSelector), so a hung
+			// agent-side network refresh would otherwise crash the attach
+			// client with an uncaughtException. Report failure in the errors
+			// map (the wire response carries no per-provider detail, and a
+			// client-side abort is not forwarded — the server refresh
+			// completes regardless).
+			const errors = new Map<string, Error>();
+			try {
+				await this.client.refreshModels();
+				this._availableModels = await this.client.getAvailableModels().catch(() => this._availableModels);
+			} catch (error) {
+				errors.set("*", error instanceof Error ? error : new Error(String(error)));
+			}
+			return { aborted: false, errors };
 		},
 		isUsingOAuth: (provider: string): boolean => this._oauthProviders.has(provider),
 		getModel: (provider: string, modelId: string): Model<any> | undefined =>

@@ -884,7 +884,14 @@ export class RpcClient {
 
 	/** Refresh model availability (network fetch of provider catalogs). */
 	async refreshModels(): Promise<void> {
-		await this.send({ type: "refresh_models" });
+		// Network-bound agent-side (registry + provider endpoints), so carry
+		// a wider budget than the 30s default. The server additionally
+		// bounds the refresh itself (refreshTimeoutMs), so this mostly
+		// covers a congested command queue.
+		const response = await this.sendWithId(`req_${++this.requestId}`, { type: "refresh_models" }, 180_000);
+		if (!response.success) {
+			throw new Error(response.error ?? "refresh_models failed");
+		}
 	}
 
 	/** Rename a session by file path (used by the remote session picker). */
