@@ -119,16 +119,41 @@ export class RemoteAgentSessionRuntime {
 	 * session_changed rebind lands the TUI on the imported session.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
-		const resolvedPath = resolvePath(inputPath, this.remoteSession.sessionManager.getCwd());
-		if (!existsSync(resolvedPath)) {
-			throw new SessionImportFileNotFoundError(resolvedPath);
+		// Relative paths mean the CLIENT's filesystem (the user typed the path
+		// in their own shell) — resolve against the attach process's cwd, not
+		// the agent's. If not found locally, fall back to reading the file
+		// agent-side over read_file (absolute paths on the agent host).
+		const clientPath = resolvePath(inputPath, process.cwd());
+		let content: string;
+		let fileName: string;
+		if (existsSync(clientPath)) {
+			content = readFileSync(clientPath, "utf8");
+			fileName = basename(clientPath);
+		} else {
+			let agentFile: { path: string; content: string; truncated: boolean };
+			try {
+				agentFile = await this.client.readFile(inputPath);
+			} catch {
+				// Neither side has it: report the client-side resolution.
+				throw new SessionImportFileNotFoundError(clientPath);
+			}
+			if (agentFile.truncated) {
+				throw new Error(`Session file too large to import over the wire: ${agentFile.path}`);
+			}
+			content = agentFile.content;
+			fileName = basename(agentFile.path);
 		}
-		const content = readFileSync(resolvedPath, "utf8");
-		const result = await this.client.importSession({
-			content,
-			fileName: basename(resolvedPath),
-			cwdOverride,
-		});
+
+		// Fail fast with a clear message for the common trap: /import reads
+		// JSONL session files; an HTML export is not importable.
+		const firstLine = content.slice(0, content.indexOf("\n")).trimStart();
+		if (!firstLine.startsWith("{")) {
+			throw new Error(
+				"Not a session JSONL file — export with `/export <file>.jsonl` and import that (HTML exports are not importable)",
+			);
+		}
+
+		const result = await this.client.importSession({ content, fileName, cwdOverride });
 		if (result.missingCwd) {
 			// Reconstruct the typed error so the TUI's stock retry flow
 			// (prompt for a cwd, retry with cwdOverride) works unchanged.

@@ -357,6 +357,49 @@ describe("RemoteAgentSession facade", () => {
 		expect(remote.sessionId).toBe(fixtureB.session.sessionId);
 	});
 
+	it("falls back to agent-side read_file for paths missing client-side", async () => {
+		const fixtureA = await startFixture({ suffix: "import-agent", persisted: true });
+		const host = fixtureA.runtimeHost as unknown as {
+			session: unknown;
+			importFromJsonl: ReturnType<typeof vi.fn>;
+		};
+		host.importFromJsonl = vi.fn(async () => ({ cancelled: false }));
+
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+
+		// Exists only on the AGENT's filesystem (fixture tempDir), not relative
+		// to the test process's cwd.
+		writeFileSync(join(fixtureA.tempDir, "agent-only.jsonl"), "{}\n", "utf8");
+
+		const result = await runtime.importFromJsonl("agent-only.jsonl");
+		expect(result.cancelled).toBe(false);
+		expect(host.importFromJsonl).toHaveBeenCalledOnce();
+	});
+
+	it("rejects HTML exports with a helpful message", async () => {
+		const fixtureA = await startFixture({ suffix: "import-html", persisted: true });
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+
+		const htmlPath = join(fixtureA.tempDir, "export.html");
+		writeFileSync(htmlPath, "<!DOCTYPE html><html>...</html>", "utf8");
+
+		const error = await runtime.importFromJsonl(htmlPath).catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toMatch(/not a session JSONL/i);
+	});
+
 	it("maps missingCwd over the wire back to MissingSessionCwdError", async () => {
 		const fixtureA = await startFixture({ suffix: "import-cwd", persisted: true });
 		const host = fixtureA.runtimeHost as unknown as { importFromJsonl: ReturnType<typeof vi.fn> };
