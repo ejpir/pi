@@ -114,10 +114,9 @@ export class RpcServer {
 	private pendingModelRefresh: Promise<unknown> | undefined;
 	/**
 	 * Per-session monotonic sequence stamped onto message_end events. The
-	 * get_messages response carries the current high-water mark, so a client
-	 * refetching mid-stream can tell replayed events (seq <= high-water,
-	 * already in the snapshot) from genuinely new ones — identity, not
-	 * structural comparison. Reset on every session rebind.
+	 * get_messages response carries the current high-water mark: seq <= mark
+	 * guarantees the message is in that snapshot. Reset on every session
+	 * rebind.
 	 */
 	private messageSeq = 0;
 	private shuttingDown = false;
@@ -482,10 +481,12 @@ export class RpcServer {
 
 		this.unsubscribe?.();
 		this.unsubscribe = session.subscribe((event) => {
-			// The subscribe callback fires after the agent appended the
-			// message, and get_messages reads the same array synchronously —
-			// so seq increments and snapshot reads can never disagree about
-			// inclusion.
+			// The message is already in session.messages when this fires, so
+			// seq <= high-water always means "included in the snapshot". The
+			// converse is weaker: get_messages can observe a message during
+			// the await window before this stamp runs (extension handlers sit
+			// between append and emit), which is why clients keep a structural
+			// fallback for newer seqs.
 			if (event.type === "message_end") {
 				this.messageSeq++;
 				this.output({ ...event, seq: this.messageSeq });
@@ -735,7 +736,7 @@ export class RpcServer {
 			}
 
 			case "cycle_model": {
-				const result = await session.cycleModel();
+				const result = await session.cycleModel(command.direction ?? "forward");
 				if (!result) {
 					return this.success(id, "cycle_model", null);
 				}

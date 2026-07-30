@@ -14,6 +14,7 @@ import { basename } from "node:path";
 import type { AgentSession } from "../../core/agent-session.ts";
 import {
 	type AgentSessionRuntime,
+	type AgentSessionRuntimeDiagnostic,
 	SessionImportError,
 	SessionImportFileNotFoundError,
 	SessionImportUnsupportedError,
@@ -39,7 +40,30 @@ export interface RemoteRuntimeOptions {
 /** How long session-replacing commands wait for the rebind event before giving up. */
 const REBIND_TIMEOUT_MS = 10_000;
 
-export class RemoteAgentSessionRuntime {
+/**
+ * Same conformance story as MirroredSessionSurface (see
+ * remote-agent-session.ts): the runtime is consumed via an
+ * `as unknown as AgentSessionRuntime` cast, so `implements` makes upstream
+ * signature drift a compile-time failure instead of a runtime one.
+ * `handleReconnect` is attach-internal and excluded.
+ */
+type MirroredRuntimeSurface = Pick<
+	AgentSessionRuntime,
+	| "services"
+	| "session"
+	| "cwd"
+	| "diagnostics"
+	| "modelFallbackMessage"
+	| "setRebindSession"
+	| "setBeforeSessionInvalidate"
+	| "newSession"
+	| "switchSession"
+	| "fork"
+	| "importFromJsonl"
+	| "dispose"
+>;
+
+export class RemoteAgentSessionRuntime implements MirroredRuntimeSurface {
 	private readonly client: RpcClient;
 	private readonly remoteSession: RemoteAgentSession;
 	private readonly options: RemoteRuntimeOptions;
@@ -77,7 +101,9 @@ export class RemoteAgentSessionRuntime {
 		return this.remoteSession.sessionManager.getCwd();
 	}
 
-	get diagnostics(): readonly unknown[] {
+	get diagnostics(): readonly AgentSessionRuntimeDiagnostic[] {
+		// The attach client starts its own diagnostics empty; agent-side
+		// startup diagnostics already surfaced in the agent's own output.
 		return [];
 	}
 

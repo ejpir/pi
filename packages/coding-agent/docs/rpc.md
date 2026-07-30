@@ -18,11 +18,13 @@ not supported yet (a Windows *client* attaching to a POSIX agent works).
 - `message_end` events carry a per-session monotonic `seq` stamp, and the
   `get_messages` response includes the current high-water mark as
   `messageSeq`: every `message_end` with `seq <= messageSeq` completed
-  before that snapshot was taken and is included in it. Clients mirroring
-  messages should apply a queued `message_end` only when its `seq` is newer
-  than their last snapshot's mark (identity, not structural comparison).
-  The sequence restarts on every session switch; older servers omit both
-  fields, so clients must treat a missing `seq` as "unknown".
+  before that snapshot was taken and is included in it. The converse is not
+  guaranteed — a snapshot may already contain a message whose stamp lands
+  after it — so clients mirroring messages should drop a queued
+  `message_end` when `seq <= messageSeq` and otherwise verify against the
+  snapshot before applying. The sequence restarts on every session switch;
+  older servers omit both fields, so clients must treat a missing `seq` as
+  "unknown".
 
 ## Starting RPC Mode
 

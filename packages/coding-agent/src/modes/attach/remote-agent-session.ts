@@ -17,7 +17,13 @@ import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import type { AgentMessage, AgentState, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { contentText, type ImageContent, type Model } from "@earendil-works/pi-ai";
-import type { AgentSessionEvent, ExtensionBindings, ModelCycleResult, SessionStats } from "../../core/agent-session.ts";
+import type {
+	AgentSession,
+	AgentSessionEvent,
+	ExtensionBindings,
+	ModelCycleResult,
+	SessionStats,
+} from "../../core/agent-session.ts";
 import { SessionImportError } from "../../core/agent-session-runtime.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
@@ -58,7 +64,85 @@ interface MirrorState {
 /** Presence sentinel for remote auth method objects — see getProviders. */
 const REMOTE_AUTH_METHOD_PRESENCE: unknown = async (): Promise<void> => {};
 
-export class RemoteAgentSession {
+/**
+ * Compile-time conformance for the TUI boundary. The facade is consumed via
+ * `as unknown as AgentSession` casts (it deliberately does NOT implement the
+ * full concrete class — unmirrored members stay a documented runtime miss),
+ * so without this, upstream renaming or re-signing a mirrored member would
+ * only surface at runtime as `undefined is not a function` in the TUI.
+ * `implements` turns every member below into a checked invariant: drift
+ * fails `tsgo --noEmit` (run by `npm run check`).
+ *
+ * Deliberately NARROWED wire-shaped projections are excluded — each carries
+ * a comment at its definition: `agent`, `sessionManager`, `modelRuntime`,
+ * `resourceLoader`, `extensionRunner`, `promptTemplates`, `getToolDefinition`
+ * (real ToolDefinitions carry execute/render functions, which cannot cross
+ * the wire; the TUI falls back to default tool rendering). Facade-internal
+ * members (`client`, `onSessionChanged`, `onDetached`, `refetchAll`,
+ * `exportToJsonlAsync`) are not part of the TUI contract.
+ */
+type MirroredSessionSurface = Pick<
+	AgentSession,
+	| "model"
+	| "thinkingLevel"
+	| "isStreaming"
+	| "isCompacting"
+	| "isIdle"
+	| "isBashRunning"
+	| "retryAttempt"
+	| "autoCompactionEnabled"
+	| "steeringMode"
+	| "followUpMode"
+	| "scopedModels"
+	| "pendingMessageCount"
+	| "sessionFile"
+	| "sessionId"
+	| "sessionName"
+	| "systemPrompt"
+	| "messages"
+	| "state"
+	| "settingsManager"
+	| "subscribe"
+	| "dispose"
+	| "bindExtensions"
+	| "prompt"
+	| "steer"
+	| "followUp"
+	| "abort"
+	| "abortCompaction"
+	| "abortBranchSummary"
+	| "abortRetry"
+	| "abortBash"
+	| "waitForIdle"
+	| "setModel"
+	| "cycleModel"
+	| "setThinkingLevel"
+	| "cycleThinkingLevel"
+	| "getAvailableThinkingLevels"
+	| "getSteeringMessages"
+	| "getFollowUpMessages"
+	| "clearQueue"
+	| "setSteeringMode"
+	| "setFollowUpMode"
+	| "setAutoCompactionEnabled"
+	| "setAutoRetryEnabled"
+	| "setScopedModels"
+	| "compact"
+	| "navigateTree"
+	| "getSessionStats"
+	| "getContextUsage"
+	| "exportToHtml"
+	| "exportToJsonl"
+	| "reload"
+	| "getLastAssistantText"
+	| "getUserMessagesForForking"
+	| "executeBash"
+	| "recordBashResult"
+	| "getAllTools"
+	| "setSessionName"
+>;
+
+export class RemoteAgentSession implements MirroredSessionSurface {
 	private readonly client: RpcClient;
 	private readonly localSettingsManager: SettingsManager;
 	private _cwd: string;
@@ -332,10 +416,13 @@ export class RemoteAgentSession {
 					// Replay hazard, drain-only: messages that completed while a
 					// refetch was in flight are already in the fresh snapshot,
 					// so queued message_ends replaying on top would double-render
-					// them. Sequenced servers make this an IDENTITY check
-					// (seq <= snapshot high-water); legacy servers fall back to
-					// exact structural matching (a replay is byte-identical to
-					// its snapshot copy). Never apply outside the drain window.
+					// them. Sequenced servers make the common case an IDENTITY check
+					// (seq <= snapshot high-water ⇒ provably included); a NEWER seq
+					// still runs the exact structural check, because the server
+					// appends before stamping (extension handlers sit between), so a
+					// snapshot can hold a message whose stamp postdates its mark.
+					// Legacy servers run the structural check alone. Never apply
+					// outside the drain window.
 					const message = e.message as AgentMessage;
 					if (!this._drainingPending || !this.isReplayedMessageEnd(message, e.seq as number | undefined)) {
 						this._messages.push(message);
@@ -385,8 +472,14 @@ export class RemoteAgentSession {
 	 */
 	private isReplayedMessageEnd(message: AgentMessage, seq: number | undefined): boolean {
 		if (typeof seq === "number") {
-			return seq <= this._snapshotSeq;
+			// seq <= high-water: provably in the snapshot. seq > high-water:
+			// USUALLY new, but the server appends to session.messages before
+			// the seq stamp runs (extension message_end handlers sit between),
+			// so a snapshot taken in that window already contains the message —
+			// the structural check catches that race for newer seqs.
+			return seq <= this._snapshotSeq || this.isMirroredMessage(message);
 		}
+		// Legacy server without stamps: structural check only.
 		return this.isMirroredMessage(message);
 	}
 
@@ -570,15 +663,15 @@ export class RemoteAgentSession {
 			.catch(() => this._availableThinkingLevels);
 	}
 
-	async cycleModel(): Promise<ModelCycleResult | null> {
-		const result = await this.client.cycleModel();
-		if (!result) return null;
+	async cycleModel(direction: "forward" | "backward" = "forward"): Promise<ModelCycleResult | undefined> {
+		const result = await this.client.cycleModel(direction);
+		if (!result) return undefined;
 		// The cycle response only carries {provider, id}; refetch state for
 		// the full model object.
 		const state = await this.client.getState();
 		this.mirror.model = state.model ?? undefined;
 		this.mirror.thinkingLevel = result.thinkingLevel;
-		if (!this.mirror.model) return null;
+		if (!this.mirror.model) return undefined;
 		return { model: this.mirror.model, thinkingLevel: result.thinkingLevel, isScoped: result.isScoped };
 	}
 
@@ -587,10 +680,28 @@ export class RemoteAgentSession {
 		void this.client.setThinkingLevel(level).catch(() => {});
 	}
 
-	async cycleThinkingLevel(): Promise<ThinkingLevel | null> {
-		const result = await this.client.cycleThinkingLevel();
-		if (result) this.mirror.thinkingLevel = result.level;
-		return result?.level ?? null;
+	cycleThinkingLevel(): ThinkingLevel | undefined {
+		// Core is SYNCHRONOUS and the TUI reads the return immediately (footer
+		// border color + "Thinking level: X" status) — an async facade showed
+		// "[object Promise]". Mirror core exactly: compute the next level from
+		// the wire-fed available levels, apply optimistically, and let the
+		// background RPC confirm (the server clamps to model capabilities).
+		if (!this.mirror.model?.reasoning) return undefined;
+		const levels = this._availableThinkingLevels;
+		const currentIndex = levels.indexOf(this.mirror.thinkingLevel);
+		const nextLevel = levels[(currentIndex + 1) % levels.length];
+		if (nextLevel === undefined) return undefined;
+		const previousLevel = this.mirror.thinkingLevel;
+		this.mirror.thinkingLevel = nextLevel;
+		this.client
+			.cycleThinkingLevel()
+			.then((result) => {
+				if (result) this.mirror.thinkingLevel = result.level;
+			})
+			.catch(() => {
+				this.mirror.thinkingLevel = previousLevel;
+			});
+		return nextLevel;
 	}
 
 	getAvailableThinkingLevels(): ThinkingLevel[] {

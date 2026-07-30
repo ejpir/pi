@@ -738,6 +738,68 @@ describe("RemoteAgentSession facade", () => {
 		mirror._drainingPending = false;
 	});
 
+	it("drops a drained message_end whose seq outran the snapshot that already contains it", async () => {
+		// get_messages can observe a message during the await window between
+		// agent-core's state append and the server's seq stamp: the snapshot
+		// then contains the message but its high-water mark predates the seq.
+		// A newer seq alone must not bypass the structural check.
+		const fixture = await startFixture({ suffix: "seq-raced", persisted: true });
+		const { remote } = await connectFacade(fixture);
+
+		const mirror = remote as unknown as {
+			applyMirror: (event: unknown) => void;
+			_messages: unknown[];
+			_drainingPending: boolean;
+			_snapshotSeq: number;
+		};
+		mirror._snapshotSeq = 10;
+
+		const raced = { role: "user", content: [{ type: "text", text: "raced" }], timestamp: 333 };
+		// Snapshot already holds the message even though its stamp is newer.
+		mirror._messages.push(structuredClone(raced));
+
+		mirror._drainingPending = true;
+		const before = mirror._messages.length;
+		mirror.applyMirror({ type: "message_end", message: raced, seq: 11 });
+		expect(mirror._messages.length).toBe(before);
+		mirror._drainingPending = false;
+	});
+
+	it("cycleThinkingLevel is synchronous (the TUI reads the return immediately)", async () => {
+		const fixture = await startFixture({ suffix: "cycle-thinking", persisted: true });
+		const { remote } = await connectFacade(fixture);
+
+		const mirror = remote as unknown as {
+			mirror: { model?: { reasoning: boolean }; thinkingLevel: string };
+			_availableThinkingLevels: Array<"off" | "low" | "high">;
+		};
+		mirror.mirror.model = { reasoning: true };
+		mirror._availableThinkingLevels = ["off", "low", "high"];
+		mirror.mirror.thinkingLevel = "off";
+
+		// A promise here used to render as "Thinking level: [object Promise]".
+		const next = remote.cycleThinkingLevel();
+		expect(typeof next).toBe("string");
+		expect(next).toBe("low");
+		// Optimistic mirror update is synchronous too.
+		expect(mirror.mirror.thinkingLevel).toBe("low");
+		expect(remote.cycleThinkingLevel()).toBe("high");
+
+		// Models without reasoning support report undefined, matching core.
+		mirror.mirror.model = { reasoning: false };
+		expect(remote.cycleThinkingLevel()).toBeUndefined();
+	});
+
+	it("cycleModel forwards the direction over the wire", async () => {
+		const fixture = await startFixture({ suffix: "cycle-model", persisted: true });
+		const { client, remote } = await connectFacade(fixture);
+
+		const spy = vi.spyOn(client, "cycleModel").mockResolvedValue(null);
+		const result = await remote.cycleModel("backward");
+		expect(spy).toHaveBeenCalledWith("backward");
+		expect(result).toBeUndefined();
+	});
+
 	it("dedups several messages replayed from one refetch window", async () => {
 		// Two messages completing during a single refetch are BOTH in the
 		// fresh snapshot; draining their queued message_ends must skip both
