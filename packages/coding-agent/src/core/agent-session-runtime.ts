@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
@@ -370,6 +370,18 @@ export class AgentSessionRuntime {
 		const resolvedPath = resolvePath(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);
+		}
+
+		// Fail fast with a clear message for the common trap: /import reads
+		// JSONL session files; an HTML export is not importable.
+		const trimmed = readFileSync(resolvedPath, "utf8").trimStart();
+		if (trimmed.length === 0) {
+			throw new Error("Session file is empty");
+		}
+		if (!trimmed.startsWith("{")) {
+			throw new Error(
+				"Not a session JSONL file — export with `/export <file>.jsonl` and import that (HTML exports are not importable)",
+			);
 		}
 
 		const sessionDir = this.session.sessionManager.getSessionDir();

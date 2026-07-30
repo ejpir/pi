@@ -670,7 +670,7 @@ export class InteractiveMode {
 			[...slashCommands, ...templateCommands, ...extensionCommands, ...skillCommandList],
 			this.sessionManager.getCwd(),
 			this.fdPath,
-			this.options.fileCompletion ?? null,
+			this.options?.fileCompletion ?? null,
 		);
 	}
 

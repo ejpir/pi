@@ -744,7 +744,13 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		}
 
 		try {
-			const scopedQuery = this.resolveScopedFuzzyQuery(query);
+			// A custom fileSearcher (e.g. attach mode's RPC fs_complete)
+			// searches the AGENT's filesystem and does its own dir-scoping —
+			// splitting the query here would stat the LOCAL filesystem and
+			// misjudge the scope whenever the same directory name exists on
+			// both hosts (always true for same-host socket attach), then
+			// re-prefix results it never stripped. Pass the raw query through.
+			const scopedQuery = this.fileSearcher ? null : this.resolveScopedFuzzyQuery(query);
 			const fdBaseDir = scopedQuery?.baseDir ?? this.basePath;
 			const fdQuery = scopedQuery?.query ?? query;
 			const entries = this.fileSearcher

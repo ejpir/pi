@@ -113,16 +113,18 @@ export class RemoteAgentSessionRuntime {
 	}
 
 	/**
-	 * /import over the wire: the file is read on the CLIENT host (it lives in
-	 * the user's filesystem), its JSONL content is uploaded into the agent's
-	 * session directory, and the agent switches to it — the resulting
-	 * session_changed rebind lands the TUI on the imported session.
+	 * /import over the wire. Path resolution precedence:
+	 *   1. resolve against the CLIENT's cwd (the user typed the path in
+	 *      their own shell) and read locally;
+	 *   2. on a local miss, read agent-side over read_file — absolute and
+	 *      "~/" paths name the agent host, a relative path resolves against
+	 *      the agent's session cwd.
+	 * If the path exists on both sides the client copy silently wins.
+	 * The JSONL content is then uploaded into the agent's session directory
+	 * and the agent switches to it — the resulting session_changed rebind
+	 * lands the TUI on the imported session.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
-		// Relative paths mean the CLIENT's filesystem (the user typed the path
-		// in their own shell) — resolve against the attach process's cwd, not
-		// the agent's. If not found locally, fall back to reading the file
-		// agent-side over read_file (absolute paths on the agent host).
 		const clientPath = resolvePath(inputPath, process.cwd());
 		let content: string;
 		let fileName: string;
@@ -133,9 +135,17 @@ export class RemoteAgentSessionRuntime {
 			let agentFile: { path: string; content: string; truncated: boolean };
 			try {
 				agentFile = await this.client.readFile(inputPath);
-			} catch {
-				// Neither side has it: report the client-side resolution.
-				throw new SessionImportFileNotFoundError(clientPath);
+			} catch (err) {
+				// Only a genuine miss becomes "not found" at the client path.
+				// read_file also fails with "Not a file"/"Binary file", and the
+				// RPC itself can time out or drop — those are agent-side errors
+				// and must surface as themselves, not as a misleading local
+				// "file not found".
+				const message = err instanceof Error ? err.message : String(err);
+				if (message.includes("File not found")) {
+					throw new SessionImportFileNotFoundError(clientPath);
+				}
+				throw new Error(`Failed to read ${inputPath} on the agent host: ${message}`);
 			}
 			if (agentFile.truncated) {
 				throw new Error(`Session file too large to import over the wire: ${agentFile.path}`);
@@ -145,9 +155,14 @@ export class RemoteAgentSessionRuntime {
 		}
 
 		// Fail fast with a clear message for the common trap: /import reads
-		// JSONL session files; an HTML export is not importable.
-		const firstLine = content.slice(0, content.indexOf("\n")).trimStart();
-		if (!firstLine.startsWith("{")) {
+		// JSONL session files; an HTML export is not importable. (Hoisted
+		// into the agent-side import too, so local /import gets the same
+		// guard.)
+		const trimmed = content.trimStart();
+		if (trimmed.length === 0) {
+			throw new Error("Session file is empty");
+		}
+		if (!trimmed.startsWith("{")) {
 			throw new Error(
 				"Not a session JSONL file — export with `/export <file>.jsonl` and import that (HTML exports are not importable)",
 			);

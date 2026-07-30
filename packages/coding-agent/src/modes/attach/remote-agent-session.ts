@@ -306,7 +306,21 @@ export class RemoteAgentSession {
 				for (const waiter of [...this.idleWaiters]) waiter();
 				break;
 			case "message_end":
-				if (e.message) this._messages.push(e.message as AgentMessage);
+				if (e.message) {
+					const message = e.message as AgentMessage;
+					// Same replay hazard as entry_appended below: a message that
+					// completed while a refetch was in flight is already in the
+					// fresh snapshot — replaying its queued message_end would
+					// double-render it. Messages carry ms timestamps, so
+					// role+timestamp identity is sufficient here.
+					const last = this._messages[this._messages.length - 1] as
+						| { role?: string; timestamp?: number }
+						| undefined;
+					const incoming = message as { role?: string; timestamp?: number };
+					if (!last || last.role !== incoming.role || last.timestamp !== incoming.timestamp) {
+						this._messages.push(message);
+					}
+				}
 				break;
 			case "queue_update":
 				this._steeringMessages = (e.steering as string[]) ?? [];

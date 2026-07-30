@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { completePaths, readSessionFile } from "../src/modes/rpc/fs-commands.ts";
@@ -102,6 +102,19 @@ describe("rpc fs-commands", () => {
 			const result = await readSessionFile(root, "big.txt");
 			expect(result.truncated).toBe(true);
 			expect(result.content.length).toBe(1024 * 1024);
+		});
+
+		it("expands ~/ to the agent host's home", async () => {
+			// A literal "~" directory must never be resolved; attach-mode
+			// /import forwards user-typed "~/..." paths for agent-side reads.
+			const probe = join(homedir(), `rpc-fs-tilde-${process.pid}.txt`);
+			writeFileSync(probe, "home\n", "utf8");
+			try {
+				const result = await readSessionFile(root, `~/${probe.split("/").pop()}`);
+				expect(result.content).toBe("home\n");
+			} finally {
+				rmSync(probe, { force: true });
+			}
 		});
 	});
 });

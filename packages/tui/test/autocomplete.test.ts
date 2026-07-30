@@ -77,6 +77,29 @@ describe("CombinedAutocompleteProvider", () => {
 			const result = await getSuggestions(provider, ["@zzz"], 0, 4);
 			assert.strictEqual(result, null);
 		});
+
+		it("passes scoped queries through unmodified when the directory also exists locally", async () => {
+			// Regression: a custom searcher (attach mode's RPC fs_complete)
+			// searches the AGENT's filesystem. When the local base happens to
+			// contain the same directory name, the provider used to split
+			// "@src/fo" with a LOCAL stat, send only "fo", then re-prefix the
+			// agent's already-scoped results into "src/src/foo.ts".
+			const base = mkdtempSync(join(tmpdir(), "tui-autocomplete-"));
+			mkdirSync(join(base, "src"));
+			const calls: string[] = [];
+			const provider = new CombinedAutocompleteProvider([], base, null, async (query) => {
+				calls.push(query);
+				return [{ path: "src/foo.ts", isDirectory: false }];
+			});
+			try {
+				const result = await getSuggestions(provider, ["@src/fo"], 0, 7);
+				assert.deepEqual(calls, ["src/fo"], "raw query must reach the searcher");
+				const values = result!.items.map((item) => item.value);
+				assert.deepEqual(values, ["@src/foo.ts"], "no scoped re-prefix");
+			} finally {
+				rmSync(base, { recursive: true, force: true });
+			}
+		});
 	});
 
 	describe("extractPathPrefix", () => {

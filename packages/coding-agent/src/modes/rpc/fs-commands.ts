@@ -10,6 +10,7 @@
  */
 
 import { type Dirent, promises as fs, type Stats } from "node:fs";
+import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /** Directories never descended into (and never returned). */
@@ -156,11 +157,14 @@ export interface ReadFileResult {
 
 /**
  * Read a UTF-8 text file for file mentions. Relative paths resolve against
- * `cwd`. No confinement is applied: the agent-side filesystem *is* the
- * security boundary (confine via the sandbox/runtime, not here).
+ * `cwd`; "~/..." expands to the agent host's home (the path is interpreted
+ * on THIS machine, not the client's). No confinement is applied: the
+ * agent-side filesystem *is* the security boundary (confine via the
+ * sandbox/runtime, not here).
  */
 export async function readSessionFile(cwd: string, filePath: string): Promise<ReadFileResult> {
-	const resolved = isAbsolute(filePath) ? resolve(filePath) : resolve(cwd, filePath);
+	const expanded = filePath === "~" || filePath.startsWith("~/") ? join(homedir(), filePath.slice(1)) : filePath;
+	const resolved = isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
 
 	let stat: Stats;
 	try {

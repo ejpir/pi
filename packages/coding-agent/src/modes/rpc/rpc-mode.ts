@@ -26,7 +26,6 @@ import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import { type RpcConnection, RpcServer } from "./rpc-server.ts";
 
-export { type RpcConnection, RpcServer, type RpcServerOptions } from "./rpc-server.ts";
 // Re-export types for consumers
 export type {
 	RpcCommand,

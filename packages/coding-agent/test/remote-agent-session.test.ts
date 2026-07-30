@@ -11,6 +11,7 @@ import { type AssistantMessage, type AssistantMessageEvent, EventStream, getMode
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import { SessionImportFileNotFoundError } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { MissingSessionCwdError } from "../src/core/session-cwd.ts";
@@ -398,6 +399,87 @@ describe("RemoteAgentSession facade", () => {
 		const error = await runtime.importFromJsonl(htmlPath).catch((e: unknown) => e);
 		expect(error).toBeInstanceOf(Error);
 		expect((error as Error).message).toMatch(/not a session JSONL/i);
+	});
+
+	it("rejects an empty session file with a clear message", async () => {
+		const fixtureA = await startFixture({ suffix: "import-empty", persisted: true });
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+
+		const emptyPath = join(fixtureA.tempDir, "empty.jsonl");
+		writeFileSync(emptyPath, "", "utf8");
+
+		const error = await runtime.importFromJsonl(emptyPath).catch((e: unknown) => e);
+		expect((error as Error).message).toMatch(/empty/i);
+	});
+
+	it("surfaces agent-side read errors instead of misreporting them as client-side not-found", async () => {
+		const fixtureA = await startFixture({ suffix: "import-binerr", persisted: true });
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+
+		// A binary file that exists only on the AGENT's cwd (relative path
+		// misses client-side): read_file rejects with "Binary file", which
+		// must surface as itself, not as "file not found" at the client path.
+		writeFileSync(join(fixtureA.tempDir, "binary-session.jsonl"), Buffer.from([0x89, 0x50, 0x00, 0x01]));
+
+		const error = await runtime.importFromJsonl("binary-session.jsonl").catch((e: unknown) => e);
+		expect((error as Error).message).toMatch(/agent host/);
+		expect((error as Error).message).toMatch(/binary file/i);
+		expect(error).not.toBeInstanceOf(SessionImportFileNotFoundError);
+	});
+
+	it("rejects agent-side files too large to read over the wire", async () => {
+		const fixtureA = await startFixture({ suffix: "import-trunc", persisted: true });
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+
+		// Just over the 1MB read_file cap, agent-side only.
+		writeFileSync(join(fixtureA.tempDir, "big-session.jsonl"), "{}\n".repeat(400_000));
+
+		const error = await runtime.importFromJsonl("big-session.jsonl").catch((e: unknown) => e);
+		expect((error as Error).message).toMatch(/too large/i);
+	});
+
+	it("dedups a message_end replayed over a refetched snapshot", async () => {
+		const fixture = await startFixture({ suffix: "msg-dedup", persisted: true });
+		await fixture.session.prompt("dedup check");
+		const { remote } = await connectFacade(fixture);
+
+		const mirror = remote as unknown as {
+			applyMirror: (event: unknown) => void;
+			_messages: unknown[];
+		};
+		const before = mirror._messages.length;
+		expect(before).toBeGreaterThan(0);
+		const last = mirror._messages[before - 1];
+
+		// Replaying the same terminal event (same role+timestamp, as a queued
+		// event drained after a refetch would) must not push a duplicate.
+		mirror.applyMirror({ type: "message_end", message: last });
+		expect(mirror._messages.length).toBe(before);
+
+		// A genuinely new message still lands.
+		mirror.applyMirror({
+			type: "message_end",
+			message: { role: "user", content: "later", timestamp: Date.now() + 60_000 },
+		});
+		expect(mirror._messages.length).toBe(before + 1);
 	});
 
 	it("maps missingCwd over the wire back to MissingSessionCwdError", async () => {

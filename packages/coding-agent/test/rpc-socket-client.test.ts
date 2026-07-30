@@ -250,6 +250,26 @@ process.stdout.write(
 		await expect(detached).resolves.toMatchObject({ type: "detached", reason: "takeover" });
 	});
 
+	it("a throwing event listener does not starve the other listeners", async () => {
+		await startFixture();
+		const first = newClient();
+		await first.start();
+		const saw: string[] = [];
+		first.onEvent(() => {
+			saw.push("thrower");
+			throw new Error("boom");
+		});
+		first.onEvent((event) => {
+			saw.push(`second:${(event as { type: string }).type}`);
+		});
+
+		const second = newClient();
+		await second.start();
+
+		await vi.waitFor(() => expect(saw).toContain("second:detached"));
+		expect(saw).toContain("thrower");
+	});
+
 	it("shutdown command terminates the server and closes the client", async () => {
 		await startFixture();
 		const client = newClient();

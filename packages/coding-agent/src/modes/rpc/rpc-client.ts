@@ -1026,34 +1026,34 @@ export class RpcClient {
 			return;
 		}
 
-		try {
-			if (data.type === "hello") {
-				this.hello = data as unknown as RpcHello;
-				if (typeof this.hello.protocol !== "number" || this.hello.protocol > RPC_PROTOCOL_VERSION) {
-					const error = new Error(
-						`Unsupported RPC protocol version: ${String(this.hello.protocol)} (client supports ${RPC_PROTOCOL_VERSION})`,
-					);
-					this.helloWaiter?.reject(error);
-				} else {
-					this.helloWaiter?.resolve(this.hello);
-				}
-				return;
+		if (data.type === "hello") {
+			this.hello = data as unknown as RpcHello;
+			if (typeof this.hello.protocol !== "number" || this.hello.protocol > RPC_PROTOCOL_VERSION) {
+				const error = new Error(
+					`Unsupported RPC protocol version: ${String(this.hello.protocol)} (client supports ${RPC_PROTOCOL_VERSION})`,
+				);
+				this.helloWaiter?.reject(error);
+			} else {
+				this.helloWaiter?.resolve(this.hello);
 			}
+			return;
+		}
 
-			// Check if it's a response to a pending request
-			if (data.type === "response" && data.id && this.pendingRequests.has(data.id as string)) {
-				const pending = this.pendingRequests.get(data.id as string)!;
-				this.pendingRequests.delete(data.id as string);
-				pending.resolve(data as unknown as RpcResponse);
-				return;
-			}
-
-			// Otherwise it's an event
-			for (const listener of this.eventListeners) {
+		// Check if it's a response to a pending request
+		if (data.type === "response" && data.id && this.pendingRequests.has(data.id as string)) {
+			const pending = this.pendingRequests.get(data.id as string)!;
+			this.pendingRequests.delete(data.id as string);
+			pending.resolve(data as unknown as RpcResponse);
+			return;
+		}
+		// Otherwise it's an event: deliver to every listener even when one
+		// throws (a throwing listener must not starve the rest).
+		for (const listener of this.eventListeners) {
+			try {
 				listener(data as unknown as AgentSessionEvent);
+			} catch {
+				// Isolate listener failures.
 			}
-		} catch {
-			// Ignore malformed lines
 		}
 	}
 

@@ -18,7 +18,7 @@
  */
 
 import * as crypto from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { VERSION } from "../../config.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
@@ -1087,6 +1087,7 @@ export class RpcServer {
 					mkdirSync(sessionDir, { recursive: true });
 				}
 				const destinationPath = join(sessionDir, fileName);
+				const replacedExisting = existsSync(destinationPath);
 				writeFileSync(destinationPath, command.content, "utf8");
 				try {
 					const result = await this.runtimeHost.importFromJsonl(destinationPath, command.cwdOverride);
@@ -1095,6 +1096,16 @@ export class RpcServer {
 					}
 					return this.success(id, "import_session", result);
 				} catch (importError: unknown) {
+					// Don't leave a failed upload behind — unless it replaced a
+					// file that was already there (then the upload is all that
+					// remains and removing it would lose the session entirely).
+					if (!replacedExisting) {
+						try {
+							unlinkSync(destinationPath);
+						} catch {
+							// Best effort.
+						}
+					}
 					if (importError instanceof MissingSessionCwdError) {
 						// Not an error for the wire: the client prompts for a cwd and
 						// retries with cwdOverride (stock /import flow).

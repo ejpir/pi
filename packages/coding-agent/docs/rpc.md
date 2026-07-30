@@ -4,6 +4,18 @@ RPC mode enables headless operation of the coding agent via a JSON protocol over
 
 **Note for Node.js/TypeScript users**: If you're building a Node.js application, consider using `AgentSession` directly from `@earendil-works/pi-coding-agent` instead of spawning a subprocess. See [`src/core/agent-session.ts`](../src/core/agent-session.ts) for the API. For a subprocess-based TypeScript client, see [`src/modes/rpc/rpc-client.ts`](../src/modes/rpc/rpc-client.ts).
 
+**Platform scope**: v1 of the socket/attach transport assumes a POSIX agent
+host — `--sock` is a unix socket, `pi attach --cmd` spawns through `sh -c`,
+and session paths are interpreted with POSIX separators. Windows agents are
+not supported yet (a Windows *client* attaching to a POSIX agent works).
+
+**Compatibility notes for embedders**:
+- Stdio RPC mode now emits a `hello` greeting line first (same shape as the
+  socket handshake). Clients should ignore unknown top-level message types.
+- With an attached socket client, `entry_appended` events fire for *every*
+  session entry (not only extension custom entries), so the client can keep
+  a full mirror. Filter by entry type if you only care about custom entries.
+
 ## Starting RPC Mode
 
 ```bash

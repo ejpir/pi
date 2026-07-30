@@ -122,10 +122,14 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 
 	remote.onDetached = (reason) => {
 		// Server-initiated: takeover means another client owns the agent now —
-		// exit immediately. shutdown/connection_lost are followed by the
-		// transport closing; the reconnect loop below handles those.
+		// exit immediately. A graceful shutdown is followed by a CLEAN transport
+		// close (error === null), which the reconnect loop below would treat as
+		// "not a failure" and ignore — so exit here too. tuiStopped guards our
+		// own exit flow (we sent the shutdown ourselves).
 		if (reason === "takeover") {
 			forceExit(reason, 2);
+		} else if (reason === "shutdown" && !tuiStopped) {
+			forceExit(reason, 0);
 		}
 	};
 
@@ -133,8 +137,12 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 	// shut down), keep redialing. A restarted agent gets a fresh mirror and
 	// the TUI rebinds to whatever session the new server holds.
 	let reconnecting = false;
-	client.onClose((error) => {
-		if (!error || tuiStopped || reconnecting) return;
+	client.onClose(() => {
+		if (tuiStopped || reconnecting) return;
+		// A close without a preceding detached event — clean closes included,
+		// e.g. a --cmd bridge exiting 0 after the agent behind it crashed —
+		// means the transport died underneath us. Treat it as connection loss
+		// and redial like any other drop.
 		reconnecting = true;
 		void (async () => {
 			const deadline = Date.now() + 30_000;
