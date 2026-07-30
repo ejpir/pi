@@ -378,7 +378,9 @@ export class AgentSession {
 		// Emit entry_appended for every append (the event previously only
 		// fired for extension custom entries). InteractiveMode's handler only
 		// renders custom entries; RPC mirrors rely on the complete stream.
+		const previousOnEntryAppended = this.sessionManager.onEntryAppended;
 		this.sessionManager.onEntryAppended = (entry) => {
+			previousOnEntryAppended?.(entry);
 			this._emit({ type: "entry_appended", entry });
 		};
 		this.settingsManager = config.settingsManager;

@@ -63,6 +63,8 @@ function fuzzyMatch(query: string, candidate: string): boolean {
  * substitute them into the user's input directly.
  */
 export async function completePaths(cwd: string, prefix: string, limit = 100): Promise<FsCompletionEntry[]> {
+	// Client-controlled: clamp to a sane upper bound.
+	limit = Math.max(1, Math.min(limit, 1000));
 	const root = resolve(cwd);
 	const normalizedPrefix = prefix.replaceAll("\\", "/");
 

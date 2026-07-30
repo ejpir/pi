@@ -96,6 +96,13 @@ async function claimSocketPath(socketPath: string): Promise<void> {
 					// Nothing to remove.
 				}
 				resolve();
+			} else if (err.code === "EACCES") {
+				reject(
+					new Error(
+						`Cannot probe socket ${socketPath}: permission denied. ` +
+							"It may belong to another user; remove it manually or choose a different --sock path.",
+					),
+				);
 			} else {
 				reject(err);
 			}
@@ -130,21 +137,27 @@ export async function createRpcSocketServer(
 
 	const connections = new Set<Socket>();
 
-	const close = async (): Promise<void> => {
+	// Re-entrant: a concurrent second call awaits the same in-flight cleanup.
+	let closePromise: Promise<void> | undefined;
+	const close = (): Promise<void> => {
+		if (closePromise) return closePromise;
 		const current = listener;
-		if (!current) return;
+		if (!current) return Promise.resolve();
 		listener = undefined;
-		await new Promise<void>((resolve) => {
-			current.close(() => resolve());
-			// close() only fires once all connections end; don't wait forever.
-			setTimeout(resolve, 2000).unref();
-			// Destroy accepted connections: mirrors process-exit semantics and
-			// lets peers observe the close (in-process restarts, tests).
-			for (const connection of connections) {
-				connection.destroy();
-			}
-		});
-		cleanupSocketFile(socketPath);
+		closePromise = (async () => {
+			await new Promise<void>((resolve) => {
+				current.close(() => resolve());
+				// close() only fires once all connections end; don't wait forever.
+				setTimeout(resolve, 2000).unref();
+				// Destroy accepted connections: mirrors process-exit semantics and
+				// lets peers observe the close (in-process restarts, tests).
+				for (const connection of connections) {
+					connection.destroy();
+				}
+			});
+			cleanupSocketFile(socketPath);
+		})();
+		return closePromise;
 	};
 
 	const rpcServer = new RpcServer(runtimeHost, {
@@ -170,16 +183,30 @@ export async function createRpcSocketServer(
 		rpcServer.attachConnection(createSocketConnection(socket));
 	});
 
-	await new Promise<void>((resolve, reject) => {
-		listener!.once("error", reject);
-		listener!.listen(socketPath, () => resolve());
-	});
+	// The socket grants full agent control with no authentication, so it must
+	// never be world-accessible: apply a restrictive umask around listen() so
+	// the socket node is created 0600 (no race window), then chmod as a
+	// belt-and-braces fix for filesystems that ignore umask.
+	const previousUmask = process.platform !== "win32" ? process.umask(0o077) : 0;
+	try {
+		await new Promise<void>((resolve, reject) => {
+			listener!.once("error", reject);
+			listener!.listen(socketPath, () => resolve());
+		});
+	} finally {
+		if (process.platform !== "win32") {
+			process.umask(previousUmask);
+		}
+	}
 
 	if (process.platform !== "win32") {
 		try {
 			chmodSync(socketPath, 0o600);
-		} catch {
-			// Best effort; filesystem may not support permissions.
+		} catch (chmodError: unknown) {
+			console.error(
+				`Warning: could not restrict permissions on ${socketPath}; the agent socket may be accessible to other users:`,
+				chmodError,
+			);
 		}
 	}
 

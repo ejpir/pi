@@ -54,41 +54,78 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 	if (!options.command && !options.socketPath) {
 		throw new Error("attach requires --cmd <command> or --sock <path>");
 	}
+	if (options.command && options.socketPath) {
+		throw new Error("--cmd and --sock are mutually exclusive");
+	}
 
 	const client = new RpcClient(
 		options.socketPath ? { socketPath: options.socketPath } : { command: options.command! },
 	);
 	await client.start();
 
-	const hello = client.getHello();
-	if (!hello) {
-		await client.stop();
-		throw new Error("agent did not complete the hello handshake");
+	// Everything between start() and the interactive run must not leak the
+	// spawned agent process / socket connection on failure.
+	const stopClientQuietly = async (): Promise<void> => {
+		await client.stop().catch(() => {});
+	};
+
+	let remote: RemoteAgentSession;
+	let runtime: RemoteAgentSessionRuntime;
+	let settingsManager: SettingsManager;
+	try {
+		const hello = client.getHello();
+		if (!hello) {
+			throw new Error("agent did not complete the hello handshake");
+		}
+
+		// Client-local settings: theme, keybindings, editor prefs stay on the
+		// attach host (see RFC "settings split").
+		settingsManager = SettingsManager.create(options.cwd, options.agentDir);
+		initTheme(settingsManager.getTheme(), true);
+
+		remote = await RemoteAgentSession.connect({ client, settingsManager });
+		runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: options.agentDir,
+		});
+	} catch (setupError: unknown) {
+		await stopClientQuietly();
+		throw setupError;
 	}
-
-	// Client-local settings: theme, keybindings, editor prefs stay on the
-	// attach host (see RFC "settings split").
-	const settingsManager = SettingsManager.create(options.cwd, options.agentDir);
-	initTheme(settingsManager.getTheme(), true);
-
-	const remote = await RemoteAgentSession.connect({ client, settingsManager });
-	const runtime = new RemoteAgentSessionRuntime({
-		client,
-		session: remote,
-		settingsManager,
-		agentDir: options.agentDir,
-	});
 
 	let detachReason: string | undefined;
 	let tuiStopped = false;
+	let exitScheduled = false;
 	let interactiveRef: InteractiveMode | undefined;
+
+	/**
+	 * Forced teardown for server-pushed detach (takeover, connection lost).
+	 * InteractiveMode.stop() restores the terminal but does NOT settle run()
+	 * (its pending input never resolves), so the only reliable way out is
+	 * process exit — consistent with every other TUI exit path.
+	 */
+	const forceExit = (reason: string, exitCode: number): void => {
+		if (exitScheduled) return;
+		exitScheduled = true;
+		detachReason = reason;
+		tuiStopped = true;
+		try {
+			interactiveRef?.stop();
+		} catch {
+			// Terminal may already be restored.
+		}
+		console.error(`\nDetached from agent: ${reason}`);
+		void stopClientQuietly().finally(() => process.exit(exitCode));
+	};
+
 	remote.onDetached = (reason) => {
 		// Server-initiated: takeover means another client owns the agent now —
 		// exit immediately. shutdown/connection_lost are followed by the
 		// transport closing; the reconnect loop below handles those.
 		if (reason === "takeover") {
-			detachReason = reason;
-			interactiveRef?.stop();
+			forceExit(reason, 2);
 		}
 	};
 
@@ -112,8 +149,7 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 				}
 			}
 			if (!tuiStopped) {
-				detachReason = "connection lost";
-				interactiveRef?.stop();
+				forceExit("connection lost", 1);
 			}
 		})();
 	});
@@ -141,6 +177,11 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 		verbose: options.verbose,
 	});
 	interactiveRef = interactive;
+	if (exitScheduled) {
+		// Takeover raced ahead of TUI startup; forceExit already fired but had
+		// no TUI to restore — stop() now for a clean terminal before exiting.
+		interactive.stop();
+	}
 
 	try {
 		await interactive.run();

@@ -40,9 +40,6 @@ export type CreateAgentSessionRuntimeFactory = (options: {
 	projectTrustContext?: ProjectTrustContext;
 }) => Promise<CreateAgentSessionRuntimeResult>;
 
-/**
- * Thrown when /import references a JSONL file path that does not exist.
- */
 /** The active runtime cannot import sessions (e.g. a remote attach facade). */
 export class SessionImportUnsupportedError extends Error {
 	constructor(message = "Session import is not supported by this runtime") {
@@ -51,6 +48,9 @@ export class SessionImportUnsupportedError extends Error {
 	}
 }
 
+/**
+ * Thrown when /import references a JSONL file path that does not exist.
+ */
 export class SessionImportFileNotFoundError extends Error {
 	readonly filePath: string;
 

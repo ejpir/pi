@@ -1054,7 +1054,12 @@ export class SessionManager {
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
-		this.onEntryAppended?.(entry);
+		try {
+			this.onEntryAppended?.(entry);
+		} catch {
+			// A listener must never break the append path (persistence already
+			// succeeded); swallow to keep SessionManager failures impossible.
+		}
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.

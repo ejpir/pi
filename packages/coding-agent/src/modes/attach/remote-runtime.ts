@@ -38,6 +38,8 @@ export class RemoteAgentSessionRuntime {
 	private rebindCb: ((session: AgentSession) => Promise<void>) | undefined;
 	private beforeInvalidateCb: (() => void) | undefined;
 	private rebinding = false;
+	/** Set when a session_changed arrives mid-rebind; coalesced and re-run. */
+	private rebindPending = false;
 	private rebindWaiter: (() => void) | undefined;
 
 	constructor(options: RemoteRuntimeOptions) {
@@ -131,7 +133,12 @@ export class RemoteAgentSessionRuntime {
 				clearTimeout(timer);
 				resolve();
 			};
+			// A second session-replacing call while one awaits its rebind:
+			// resolve the first waiter rather than stranding it for the full
+			// timeout — the upcoming rebind covers both.
+			const previous = this.rebindWaiter;
 			this.rebindWaiter = waiter;
+			previous?.();
 		});
 	}
 
@@ -142,7 +149,7 @@ export class RemoteAgentSessionRuntime {
 	 * one or the same session file resumed — the mirror reflects either.
 	 */
 	async handleReconnect(): Promise<void> {
-		await this.rebindFromMirror();
+		await this.handleSessionChanged();
 	}
 
 	private async rebindFromMirror(): Promise<void> {
@@ -150,17 +157,31 @@ export class RemoteAgentSessionRuntime {
 			this.beforeInvalidateCb?.();
 			await this.remoteSession.refetchAll();
 			await this.rebindCb?.(this.session);
-		} catch {
+		} catch (rebindError: unknown) {
 			// Rebind failures must not kill the event loop; the mirror is
-			// already refetched, so the TUI stays usable.
+			// already refetched, so the TUI stays usable. Still log — a silent
+			// failure here otherwise presents as a mysteriously stale TUI.
+			console.error(
+				"attach: session rebind failed:",
+				rebindError instanceof Error ? rebindError.message : rebindError,
+			);
 		}
 	}
 
 	private async handleSessionChanged(): Promise<void> {
-		if (this.rebinding) return;
+		if (this.rebinding) {
+			// A second session change raced the in-flight rebind: coalesce it
+			// and re-run once, so the TUI never stays bound to an intermediate
+			// session. The waiter is still signalled below.
+			this.rebindPending = true;
+			return;
+		}
 		this.rebinding = true;
 		try {
-			await this.rebindFromMirror();
+			do {
+				this.rebindPending = false;
+				await this.rebindFromMirror();
+			} while (this.rebindPending);
 		} finally {
 			this.rebinding = false;
 			const waiter = this.rebindWaiter;

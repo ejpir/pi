@@ -111,15 +111,33 @@ export class RemoteAgentSession {
 
 	static async connect(options: RemoteAgentSessionOptions): Promise<RemoteAgentSession> {
 		const session = new RemoteAgentSession(options);
-		await session.refetchAll();
+		// Subscribe before the initial refetch: events arriving during the
+		// refetch window are queued and applied after it (see refetchAll).
 		options.client.onEvent((event) => session.routeEvent(event));
+		await session.refetchAll();
 		return session;
 	}
 
 	/** Full mirror refetch. Called at attach and on session_changed. */
 	async refetchAll(): Promise<void> {
-		const [state, entries, messages, systemPrompt, usage, tools, levels, models, auth, resources] = await Promise.all(
-			[
+		this._refetching++;
+		try {
+			await this.refetchAllInner();
+		} finally {
+			this._refetching--;
+			if (this._refetching === 0) {
+				const queued = this._pendingEvents;
+				this._pendingEvents = [];
+				for (const event of queued) {
+					this.routeEvent(event);
+				}
+			}
+		}
+	}
+
+	private async refetchAllInner(): Promise<void> {
+		const [state, entries, messages, systemPrompt, usage, tools, levels, models, auth, resources, commands] =
+			await Promise.all([
 				this.client.getState(),
 				this.client.getEntries(),
 				this.client.getMessages(),
@@ -130,8 +148,8 @@ export class RemoteAgentSession {
 				this.client.getAvailableModels(),
 				this.client.getAuthStatus(),
 				this.client.getResources(),
-			],
-		);
+				this.client.getCommands(),
+			]);
 
 		this.mirror = {
 			...this.mirror,
@@ -166,6 +184,7 @@ export class RemoteAgentSession {
 		this._oauthProviders = new Set(auth.oauthProviders);
 		this._authProviders = auth.providers ?? [];
 		this._credentials = auth.credentials ?? [];
+		this._commands = commands;
 		this._resources = resources;
 	}
 
@@ -173,7 +192,17 @@ export class RemoteAgentSession {
 	// Event routing and mirror maintenance
 	// =========================================================================
 
+	/** >0 while a refetch is in flight; events queue instead of applying. */
+	private _refetching = 0;
+	private _pendingEvents: RpcServerEvent[] = [];
+
 	private routeEvent(event: RpcServerEvent): void {
+		if (this._refetching > 0) {
+			// The refetch replaces mirrored state wholesale; applying events
+			// mid-flight would interleave stale and fresh data. Queue and drain.
+			this._pendingEvents.push(event);
+			return;
+		}
 		switch (event.type) {
 			case "extension_ui_request":
 				void this.handleUIRequest(event as RpcExtensionUIRequest);
@@ -250,6 +279,9 @@ export class RemoteAgentSession {
 				break;
 			case "entry_appended": {
 				const entry = e.entry as SessionEntry;
+				// Dedup: a queued event drained after a refetch may replay an
+				// entry the refetched snapshot already contains.
+				if (this._entries.some((existing) => existing.id === entry.id)) break;
 				this._entries.push(entry);
 				this._leafId = entry.id;
 				break;
@@ -320,6 +352,11 @@ export class RemoteAgentSession {
 					return;
 				case "set_editor_text":
 					ui.setEditorText?.(request.text);
+					return;
+				default:
+					// Unknown method (newer agent than this client): settle the
+					// server-side dialog instead of leaving it pending.
+					respond({ cancelled: true });
 					return;
 			}
 		} catch {
@@ -394,6 +431,17 @@ export class RemoteAgentSession {
 				resolve();
 			};
 			this.idleWaiters.add(waiter);
+			// agent_settled never fires while only a local bash runs; poll the
+			// mirror so this still resolves when executeBash finishes.
+			if (!this.mirror.isStreaming && this.mirror.isBashRunning) {
+				const poll = setInterval(() => {
+					if (!this.mirror.isStreaming && !this.mirror.isBashRunning) {
+						clearInterval(poll);
+						waiter();
+					}
+				}, 50);
+				if (typeof poll.unref === "function") poll.unref();
+			}
 		});
 	}
 

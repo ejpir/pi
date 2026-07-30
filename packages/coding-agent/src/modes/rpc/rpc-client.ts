@@ -127,6 +127,10 @@ export class RpcClient {
 	private exitError: Error | null = null;
 	private hello: RpcHello | undefined;
 	private helloWaiter: { resolve: (hello: RpcHello) => void; reject: (error: Error) => void } | null = null;
+	/** handleTransportClosed fires at most once per transport lifecycle. */
+	private transportClosedNotified = false;
+	/** Intentional stop in progress: transport teardown is not an error. */
+	private stopping = false;
 	private options: RpcClientOptions;
 
 	constructor(options: RpcClientOptions = {}) {
@@ -149,6 +153,8 @@ export class RpcClient {
 
 		this.exitError = null;
 		this.hello = undefined;
+		this.stopping = false;
+		this.transportClosedNotified = false;
 
 		if (this.options.socketPath) {
 			this.startSocket(this.options.socketPath);
@@ -157,16 +163,34 @@ export class RpcClient {
 		}
 
 		const requireHello = this.options.requireHello ?? Boolean(this.options.command || this.options.socketPath);
-		if (requireHello) {
-			await this.waitForHello();
-		} else {
-			// Legacy spawn behavior: give the process a moment to initialize.
-			await new Promise((resolve) => setTimeout(resolve, 100));
-			if (this.process && this.process.exitCode !== null) {
-				const error = this.exitError ?? this.createExitError(this.process.exitCode, this.process.signalCode);
-				this.exitError = error;
-				throw error;
+		try {
+			if (requireHello) {
+				await this.waitForHello();
+			} else {
+				// Legacy spawn behavior: give the process a moment to initialize.
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				if (this.process && this.process.exitCode !== null) {
+					const error = this.exitError ?? this.createExitError(this.process.exitCode, this.process.signalCode);
+					this.exitError = error;
+					throw error;
+				}
 			}
+		} catch (startError: unknown) {
+			// Handshake failed: tear down the half-open transport instead of
+			// leaking the process/socket.
+			this.stopping = true;
+			this.stopReading?.();
+			this.stopReading = null;
+			if (this.socket) {
+				this.socket.destroy();
+				this.socket = null;
+			}
+			if (this.process && this.process.exitCode === null) {
+				this.process.kill("SIGKILL");
+			}
+			this.process = null;
+			this.writer = null;
+			throw startError;
 		}
 	}
 
@@ -210,8 +234,7 @@ export class RpcClient {
 
 		childProcess.once("exit", (code, signal) => {
 			if (this.process !== childProcess) return;
-			const error = this.createExitError(code, signal);
-			this.handleTransportClosed(error);
+			this.handleTransportClosed(this.stopping ? null : this.createExitError(code, signal));
 		});
 		childProcess.once("error", (error) => {
 			if (this.process !== childProcess) return;
@@ -242,6 +265,7 @@ export class RpcClient {
 		this.socket = socket;
 
 		socket.once("error", (error) => {
+			if (this.socket !== socket) return; // stale socket after reconnect/stop
 			this.handleTransportClosed(new Error(`Agent socket error: ${error.message}`));
 		});
 		socket.once("close", (hadError) => {
@@ -297,7 +321,7 @@ export class RpcClient {
 
 	/** Whether the server advertised a capability in its hello. */
 	hasCapability(capability: string): boolean {
-		return this.hello?.capabilities.includes(capability) ?? false;
+		return this.hello?.capabilities?.includes(capability) ?? false;
 	}
 
 	/**
@@ -316,11 +340,18 @@ export class RpcClient {
 		}
 		this.stopReading?.();
 		this.stopReading = null;
+		if (this.socket && !this.socket.destroyed) {
+			// Half-open transport (e.g. connected but hello never completed):
+			// destroy before re-dialing so it cannot linger or fire stale events.
+			this.socket.destroy();
+		}
 		this.socket = null;
 		this.writer = null;
 		this.exitError = null;
 		this.hello = undefined;
 		this.stderr = "";
+		this.stopping = false;
+		this.transportClosedNotified = false;
 
 		this.startSocket(this.options.socketPath);
 		if (this.options.requireHello ?? true) {
@@ -353,10 +384,14 @@ export class RpcClient {
 					// Best effort.
 				}
 			}
+			this.stopping = true;
 			socket.destroy();
 			this.socket = null;
 			this.writer = null;
-			this.pendingRequests.clear();
+			// Settle everything: reject in-flight requests and notify close
+			// listeners (intentional stop → null error). The async 'close'
+			// event early-returns because this.socket no longer matches.
+			this.handleTransportClosed(null);
 			return;
 		}
 
@@ -396,7 +431,9 @@ export class RpcClient {
 
 		this.process = null;
 		this.writer = null;
-		this.pendingRequests.clear();
+		// The 'exit' handler may have already run (reporting a null error when
+		// stopping); handleTransportClosed is idempotent per transport.
+		this.handleTransportClosed(null);
 	}
 
 	/**
@@ -963,6 +1000,8 @@ export class RpcClient {
 	}
 
 	private handleTransportClosed(error: Error | null): void {
+		if (this.transportClosedNotified) return;
+		this.transportClosedNotified = true;
 		if (error) {
 			this.exitError = error;
 		}
@@ -1009,6 +1048,9 @@ export class RpcClient {
 	}
 
 	private async sendWithId(id: string, command: RpcCommandBody): Promise<RpcResponse> {
+		if (this.pendingRequests.has(id)) {
+			throw new Error(`Duplicate in-flight request id: ${id}`);
+		}
 		const fullCommand = { ...command, id } as RpcCommand;
 
 		return new Promise((resolve, reject) => {

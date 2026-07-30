@@ -90,7 +90,9 @@ export class RpcServer {
 	private explicitlyDetached = false;
 	private pendingExtensionRequests = new Map<string, PendingExtensionRequest>();
 	private unsubscribe: (() => void) | undefined;
-	private unsubscribeBackpressure: (() => void) | undefined;
+	/** Agent-level event listeners (e.g. stdio backpressure) that must survive session rebinds. */
+	private agentEventListeners = new Set<() => void | Promise<void>>();
+	private agentEventUnsubscribe: (() => void) | undefined;
 	private shutdownRequested = false;
 	private shuttingDown = false;
 	private detachGraceMs: number;
@@ -433,13 +435,13 @@ export class RpcServer {
 		});
 
 		this.unsubscribe?.();
-		this.unsubscribeBackpressure?.();
 		this.unsubscribe = session.subscribe((event) => {
 			this.output(event);
 			if (event.type === "agent_settled") {
 				void this.checkShutdownRequested();
 			}
 		});
+		this.installAgentEventSubscription();
 		// Backpressure hook is installed by the stdio adapter (output-guard);
 		// transports with their own drain handling can subscribe similarly.
 
@@ -454,8 +456,35 @@ export class RpcServer {
 	};
 
 	/** Let a transport subscribe to raw agent events (e.g. for backpressure). */
+	/**
+	 * Subscribe to raw agent events. Unlike session events, this subscription is
+	 * rebind-aware: it is re-installed on the new session's agent after
+	 * new_session / switch_session / fork / clone, so transports relying on it
+	 * (stdio backpressure) keep working across session swaps.
+	 */
 	subscribeAgentEvents(listener: () => void | Promise<void>): () => void {
-		return this.session.agent.subscribe(listener);
+		this.agentEventListeners.add(listener);
+		if (this.agentEventListeners.size === 1) {
+			this.installAgentEventSubscription();
+		}
+		return () => {
+			this.agentEventListeners.delete(listener);
+			if (this.agentEventListeners.size === 0) {
+				this.agentEventUnsubscribe?.();
+				this.agentEventUnsubscribe = undefined;
+			}
+		};
+	}
+
+	private installAgentEventSubscription(): void {
+		this.agentEventUnsubscribe?.();
+		this.agentEventUnsubscribe = undefined;
+		if (this.agentEventListeners.size === 0) return;
+		this.agentEventUnsubscribe = this.session.agent.subscribe(() => {
+			for (const listener of this.agentEventListeners) {
+				void listener();
+			}
+		});
 	}
 
 	// =========================================================================
@@ -508,6 +537,18 @@ export class RpcServer {
 			return;
 		}
 
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			Array.isArray(parsed) ||
+			typeof (parsed as { type?: unknown }).type !== "string"
+		) {
+			connection.send(
+				this.error(undefined, "parse", "Invalid command: expected an object with a string 'type' field"),
+			);
+			return;
+		}
+
 		const command = parsed as RpcCommand;
 		try {
 			const response = await this.handleCommand(connection, command);
@@ -516,13 +557,17 @@ export class RpcServer {
 			}
 			await this.checkShutdownRequested();
 		} catch (commandError: unknown) {
-			connection.send(
-				this.error(
-					command.id,
-					command.type,
-					commandError instanceof Error ? commandError.message : String(commandError),
-				),
-			);
+			// Guard the send: a takeover during an in-flight command must not
+			// let this (replaced) connection push error responses to the client.
+			if (this.connection === connection) {
+				connection.send(
+					this.error(
+						command.id,
+						command.type,
+						commandError instanceof Error ? commandError.message : String(commandError),
+					),
+				);
+			}
 		}
 	}
 
@@ -1061,9 +1106,17 @@ export class RpcServer {
 		}
 
 		this.unsubscribe?.();
-		this.unsubscribeBackpressure?.();
+		this.agentEventUnsubscribe?.();
 		this.unsubscribe = undefined;
-		this.unsubscribeBackpressure = undefined;
+		this.agentEventUnsubscribe = undefined;
+		this.agentEventListeners.clear();
+
+		// Nothing can answer outstanding extension dialogs anymore — settle them
+		// with defaults so extensions awaiting a response don't stall dispose
+		// and process exit.
+		for (const entry of this.pendingExtensionRequests.values()) {
+			this.settle(entry, entry.defaultValue);
+		}
 
 		await this.runtimeHost.dispose();
 		await this.options.onShutdown(exitCode);
