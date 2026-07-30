@@ -912,6 +912,7 @@ export async function main(args: string[], options?: MainOptions) {
 			initialImages,
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
+			alt: parsed.alt,
 		});
 		if (startupBenchmark) {
 			await interactiveMode.init();
