@@ -72,6 +72,24 @@ describe("CombinedAutocompleteProvider", () => {
 			assert.ok(labels.includes("main.go"), `expected main.go in ${labels}`);
 		});
 
+		it("does not re-score server-scoped results against the raw query", async () => {
+			// Regression: the provider scored searcher results against the RAW
+			// query ("src/f"), rejecting valid scoped hits — "src/f" is not
+			// contiguous in "src/components/foo.ts".
+			const provider = new CombinedAutocompleteProvider([], "/nonexistent-base", null, async (query) => {
+				assert.equal(query, "src/f");
+				return [
+					{ path: "src/components/foo.ts", isDirectory: false },
+					{ path: "src/forms.ts", isDirectory: false },
+				];
+			});
+			const result = await getSuggestions(provider, ["@src/f"], 0, 6);
+			assert.notEqual(result, null, "scoped hits must survive");
+			const values = result!.items.map((item) => item.value);
+			assert.ok(values.includes("@src/components/foo.ts"), `expected foo.ts in ${values}`);
+			assert.ok(values.includes("@src/forms.ts"), `expected forms.ts in ${values}`);
+		});
+
 		it("returns null when the custom searcher yields nothing", async () => {
 			const provider = new CombinedAutocompleteProvider([], "/nonexistent-base", null, async () => []);
 			const result = await getSuggestions(provider, ["@zzz"], 0, 4);

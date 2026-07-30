@@ -178,6 +178,17 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 			if (!next) return;
 			await client.renameSession(sessionPath, next);
 		},
+		deleteSession: async (sessionPath) => {
+			// Delete on the AGENT host: the picker's paths name agent-side files.
+			// Local trash/unlink would falsely report success for absent paths or
+			// delete an unrelated client file on a path collision.
+			try {
+				await client.deleteSession(sessionPath);
+				return { ok: true };
+			} catch (error: unknown) {
+				return { ok: false, error: error instanceof Error ? error.message : String(error) };
+			}
+		},
 	};
 
 	const interactive = new InteractiveMode(asAgentSessionRuntime(runtime), {

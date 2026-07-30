@@ -21,6 +21,7 @@ import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.t
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { ContextUsage, ToolInfo } from "../../core/extensions/types.ts";
+import { MissingSessionCwdError } from "../../core/session-cwd.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
@@ -123,6 +124,16 @@ export class RpcClient {
 	private writer: { write(line: string): void } | null = null;
 	private stopReading: (() => void) | null = null;
 	private eventListeners: RpcEventListener[] = [];
+	/**
+	 * Events that arrive between the hello response and the first onEvent
+	 * registration (the server re-emits pending extension dialogs immediately
+	 * after hello; attach-mode registers its listener only after start()
+	 * resolves). Buffering keeps a coalesced dialog event from being dropped
+	 * while the listener list is empty, which would leave the agent awaiting
+	 * an answer forever. Flushed on the first onEvent; capped defensively.
+	 */
+	private earlyEvents: AgentSessionEvent[] = [];
+	private listenersEverRegistered = false;
 	private closeListeners: RpcCloseListener[] = [];
 	private pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
@@ -454,6 +465,19 @@ export class RpcClient {
 	 */
 	onEvent(listener: RpcEventListener): () => void {
 		this.eventListeners.push(listener);
+		// Replay anything that raced the first registration (see earlyEvents).
+		if (this.earlyEvents.length > 0) {
+			const buffered = this.earlyEvents;
+			this.earlyEvents = [];
+			for (const event of buffered) {
+				try {
+					listener(event);
+				} catch {
+					// Isolate listener failures.
+				}
+			}
+		}
+		this.listenersEverRegistered = true;
 		return () => {
 			const index = this.eventListeners.indexOf(listener);
 			if (index !== -1) {
@@ -675,9 +699,22 @@ export class RpcClient {
 	 * Switch to a different session file.
 	 * @returns Object with `cancelled: true` if an extension cancelled the switch
 	 */
-	async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
-		const response = await this.send({ type: "switch_session", sessionPath });
+	async switchSession(sessionPath: string, options?: { cwdOverride?: string }): Promise<{ cancelled: boolean }> {
+		const response = await this.send({ type: "switch_session", sessionPath, cwdOverride: options?.cwdOverride });
+		if (!response.success) {
+			if (response.missingCwd) {
+				// Reconstruct the typed error so the TUI runs its missing-cwd
+				// prompt and retries with cwdOverride (stock /resume flow).
+				throw new MissingSessionCwdError(response.missingCwd);
+			}
+			throw new Error(response.error);
+		}
 		return this.getData(response);
+	}
+
+	/** Delete a session file on the agent host (server validates against listed sessions). */
+	async deleteSession(sessionPath: string): Promise<void> {
+		await this.sendChecked({ type: "delete_session", sessionPath });
 	}
 
 	/**
@@ -1048,6 +1085,15 @@ export class RpcClient {
 			const pending = this.pendingRequests.get(data.id as string)!;
 			this.pendingRequests.delete(data.id as string);
 			pending.resolve(data as unknown as RpcResponse);
+			return;
+		}
+		// Buffer events that race the first listener registration (see
+		// earlyEvents): dropping a pending extension dialog here leaves the
+		// agent awaiting an answer forever.
+		if (!this.listenersEverRegistered && this.eventListeners.length === 0) {
+			if (this.earlyEvents.length < 1000) {
+				this.earlyEvents.push(data as unknown as AgentSessionEvent);
+			}
 			return;
 		}
 		// Otherwise it's an event: deliver to every listener even when one

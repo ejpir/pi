@@ -15,8 +15,10 @@ import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { serializeJsonLine } from "../src/modes/rpc/jsonl.ts";
 import { RpcClient } from "../src/modes/rpc/rpc-client.ts";
 import { createRpcSocketServer, type RpcSocketServer } from "../src/modes/rpc/rpc-socket-mode.ts";
+import { RPC_PROTOCOL_VERSION } from "../src/modes/rpc/rpc-types.ts";
 import { createModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
@@ -295,6 +297,59 @@ process.stdout.write(
 		// A retry coalesces onto the in-flight refresh instead of stacking.
 		await client.refreshModels();
 		expect(refreshCalls).toBe(1);
+	});
+
+	it("rejects commands from a superseded (taken-over) connection", async () => {
+		await startFixture();
+		const client1 = newClient();
+		await client1.start();
+		const client2 = newClient();
+		await client2.start(); // takeover
+
+		// The old socket closes gracefully on takeover; a line racing in during
+		// that window must NOT execute. (The wire-level answer is either the
+		// explicit "superseded" error or a transport close — the property that
+		// matters is that the mutation never lands.)
+		await expect(client1.setSessionName("pwned-by-old-client")).rejects.toThrow();
+		const state = await client2.getState();
+		expect(state.sessionId).toBeTruthy();
+		expect(state.sessionName ?? "").not.toBe("pwned-by-old-client");
+	});
+
+	it("buffers events that arrive between hello and the first listener", async () => {
+		// The server re-emits pending extension dialogs immediately after
+		// hello; attach-mode registers its listener only after start()
+		// resolves. A dialog event landing in that window must not be dropped
+		// (the agent would await its answer forever).
+		const { createServer } = await import("node:net");
+		const earlyDir = join(tmpdir(), `pi-rpc-early-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(earlyDir, { recursive: true });
+		const earlySock = join(earlyDir, "early.sock");
+		const fakeServer = createServer((socket) => {
+			socket.write(
+				`${serializeJsonLine({ type: "hello", protocol: RPC_PROTOCOL_VERSION, version: "test", sessionId: "s", cwd: "/x", capabilities: [] })}\n`,
+			);
+			socket.write(
+				`${serializeJsonLine({ type: "extension_ui_request", id: "dlg-1", method: "confirm", message: "proceed?" })}\n`,
+			);
+		});
+		try {
+			await new Promise<void>((resolve) => fakeServer.listen(earlySock, () => resolve()));
+			const client = new RpcClient({ socketPath: earlySock });
+			clients.push(client);
+			await client.start();
+			// Let the dialog line arrive while NO listener is registered.
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			const seen: unknown[] = [];
+			client.onEvent((event) => seen.push(event));
+			expect(seen).toHaveLength(1);
+			expect((seen[0] as { id?: string }).id).toBe("dlg-1");
+			await client.stop().catch(() => {});
+		} finally {
+			(fakeServer as { closeAllConnections?: () => void }).closeAllConnections?.();
+			await new Promise((resolve) => fakeServer.close(() => resolve(undefined)));
+			rmSync(earlyDir, { recursive: true, force: true });
+		}
 	});
 
 	it("void commands surface error responses instead of swallowing them", async () => {

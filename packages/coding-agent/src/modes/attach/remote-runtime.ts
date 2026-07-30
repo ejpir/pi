@@ -100,18 +100,30 @@ export class RemoteAgentSessionRuntime {
 		return { cancelled: result.cancelled };
 	}
 
-	async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
+	async switchSession(sessionPath: string, options?: { cwdOverride?: string }): Promise<{ cancelled: boolean }> {
 		const rebind = this.expectRebind();
-		const result = await this.client.switchSession(sessionPath);
+		// cwdOverride completes the missing-cwd retry: the client surfaces a
+		// reconstructed MissingSessionCwdError, the TUI prompts, and the retry
+		// carries the chosen cwd here.
+		const result = await this.client.switchSession(sessionPath, { cwdOverride: options?.cwdOverride });
 		if (!result.cancelled) await rebind;
 		return { cancelled: result.cancelled };
 	}
 
 	async fork(
 		entryId: string,
-		_options?: { createCopy?: boolean },
+		options?: { position?: "before" | "at"; createCopy?: boolean },
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
 		const rebind = this.expectRebind();
+		if (options?.position === "at") {
+			// /clone semantics: replace the current leaf. The wire fork command
+			// defaults to "before", which fails with "Invalid entry ID" whenever
+			// the leaf is an assistant/tool entry (i.e. always); the dedicated
+			// clone command forks the agent's own leaf with position "at".
+			const result = await this.client.clone();
+			if (!result.cancelled) await rebind;
+			return { cancelled: result.cancelled };
+		}
 		const result = await this.client.fork(entryId);
 		if (!result.cancelled) await rebind;
 		return { cancelled: result.cancelled, selectedText: result.text };

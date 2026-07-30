@@ -10,7 +10,7 @@
  * user can connect. Peer-credential verification is follow-up work.
  */
 
-import { chmodSync, unlinkSync } from "node:fs";
+import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { createServer, type Server, Socket } from "node:net";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
@@ -91,11 +91,27 @@ async function claimSocketPath(socketPath: string): Promise<void> {
 		const probe = new Socket();
 		probe.once("error", (err: NodeJS.ErrnoException) => {
 			if (err.code === "ECONNREFUSED" || err.code === "ENOENT") {
-				// Stale socket (or nothing there): safe to remove.
+				// Stale socket (or nothing there): safe to remove — but ONLY if
+				// it is actually a socket. Connecting to a regular file also
+				// yields ECONNREFUSED, and deleting that would destroy user data.
 				try {
+					const stat = lstatSync(socketPath);
+					if (!stat.isSocket()) {
+						reject(
+							new Error(
+								`Refusing to remove non-socket file at ${socketPath}. ` +
+									"Remove it yourself or choose a different --sock path.",
+							),
+						);
+						return;
+					}
 					unlinkSync(socketPath);
-				} catch {
-					// Nothing to remove.
+				} catch (statError: unknown) {
+					if ((statError as NodeJS.ErrnoException).code !== "ENOENT") {
+						reject(statError);
+						return;
+					}
+					// Nothing there.
 				}
 				resolve();
 			} else if (err.code === "EACCES") {
@@ -120,6 +136,9 @@ async function claimSocketPath(socketPath: string): Promise<void> {
 function cleanupSocketFile(socketPath: string): void {
 	if (process.platform === "win32") return;
 	try {
+		// Fail closed: a same-path replacement that is not a socket is not
+		// ours to delete.
+		if (!lstatSync(socketPath).isSocket()) return;
 		unlinkSync(socketPath);
 	} catch {
 		// Already gone.
@@ -244,7 +263,13 @@ export async function runRpcSocketMode(
 	for (const signal of signals) {
 		process.on(signal, () => {
 			killTrackedDetachedChildren();
-			void shutdown(signal === "SIGHUP" ? 129 : 143);
+			const exitCode = signal === "SIGHUP" ? 129 : 143;
+			// Route through RpcServer.shutdown so runtimeHost.dispose() runs
+			// (session_shutdown hooks, extension cleanup); onShutdown reaches
+			// the local shutdown() for listener cleanup and exit.
+			void socketServer?.server.shutdown(exitCode);
+			// Never let a hung dispose trap the process on a signal.
+			setTimeout(() => process.exit(exitCode), 5000).unref();
 		});
 	}
 

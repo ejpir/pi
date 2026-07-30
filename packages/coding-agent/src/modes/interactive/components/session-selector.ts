@@ -710,6 +710,9 @@ export class SessionSelectorComponent extends Container implements Focusable {
 	private allSessionsLoader: SessionsLoader;
 	private requestRender: () => void;
 	private renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
+	private deleteSession?: (
+		sessionPath: string,
+	) => Promise<{ ok: boolean; method?: "trash" | "unlink"; error?: string }>;
 	private currentLoading = false;
 	private allLoading = false;
 	private allLoadSeq = 0;
@@ -755,6 +758,12 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		requestRender: () => void,
 		options?: {
 			renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
+			/**
+			 * Custom deletion (e.g. remote attach: delete on the AGENT host via
+			 * RPC instead of the client filesystem). Defaults to local
+			 * trash/unlink.
+			 */
+			deleteSession?: (sessionPath: string) => Promise<{ ok: boolean; method?: "trash" | "unlink"; error?: string }>;
 			showRenameHint?: boolean;
 			keybindings?: KeybindingsManager;
 		},
@@ -768,6 +777,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		this.header = new SessionSelectorHeader(this.scope, this.sortMode, this.nameFilter, this.requestRender);
 		const renameSession = options?.renameSession;
 		this.renameSession = renameSession;
+		this.deleteSession = options?.deleteSession;
 		this.canRename = !!renameSession;
 		this.header.setShowRenameHint(options?.showRenameHint ?? this.canRename);
 
@@ -830,7 +840,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 		// Handle session deletion
 		this.sessionList.onDeleteSession = async (sessionPath: string) => {
-			const result = await deleteSessionFile(sessionPath);
+			const result = await (this.deleteSession ?? deleteSessionFile)(sessionPath);
 
 			if (result.ok) {
 				if (this.currentSessions) {

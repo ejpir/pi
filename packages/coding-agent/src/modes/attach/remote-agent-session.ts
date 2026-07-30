@@ -13,9 +13,12 @@
  * RemoteAgentSessionRuntime).
  */
 
+import { randomUUID } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import type { AgentMessage, AgentState, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { contentText, type ImageContent, type Model } from "@earendil-works/pi-ai";
 import type { AgentSessionEvent, ExtensionBindings, ModelCycleResult, SessionStats } from "../../core/agent-session.ts";
+import { SessionImportError } from "../../core/agent-session-runtime.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { ContextUsage, ToolInfo } from "../../core/extensions/types.ts";
@@ -27,7 +30,7 @@ import type { SourceInfo } from "../../core/source-info.ts";
 import { addUsageToTotals, createUsageTotals } from "../../core/usage-totals.ts";
 import type { Theme } from "../interactive/theme/theme.ts";
 import type { ModelInfo, RpcClient, RpcServerEvent } from "../rpc/rpc-client.ts";
-import type { RpcExtensionUIRequest, RpcResources, RpcSlashCommand } from "../rpc/rpc-types.ts";
+import type { RpcAuthStatus, RpcExtensionUIRequest, RpcResources, RpcSlashCommand } from "../rpc/rpc-types.ts";
 
 export interface RemoteAgentSessionOptions {
 	client: RpcClient;
@@ -52,6 +55,9 @@ interface MirrorState {
 	isBashRunning: boolean;
 }
 
+/** Presence sentinel for remote auth method objects — see getProviders. */
+const REMOTE_AUTH_METHOD_PRESENCE: unknown = async (): Promise<void> => {};
+
 export class RemoteAgentSession {
 	private readonly client: RpcClient;
 	private readonly localSettingsManager: SettingsManager;
@@ -70,7 +76,7 @@ export class RemoteAgentSession {
 	// objects. We store the declared shape and cast at the TUI boundary.
 	private _availableModels: ModelInfo[] = [];
 	private _oauthProviders = new Set<string>();
-	private _authProviders: Array<{ id: string; name: string; oauth: boolean; apiKey: boolean }> = [];
+	private _authProviders: RpcAuthStatus["providers"] = [];
 	private _credentials: Array<{ providerId: string; type: string }> = [];
 	private _steeringMessages: string[] = [];
 	private _followUpMessages: string[] = [];
@@ -704,7 +710,24 @@ export class RemoteAgentSession {
 	}
 
 	async exportToHtml(outputPath?: string): Promise<string> {
-		return (await this.client.exportHtml(outputPath)).path;
+		// The agent exports on ITS filesystem; the caller's path (/share's
+		// os.tmpdir(), /export's user path) names a CLIENT file. Export
+		// agent-side, pull the content over read_file, and write it locally —
+		// otherwise `gh gist create <path>` reads a stale or missing client
+		// file while the real export sits on the other host.
+		// Explicit agent-side temp path: the server's default export location
+		// may be cwd-relative, which read_file could resolve differently.
+		const agentPath = `/tmp/pi-export-${randomUUID()}.html`;
+		await this.client.exportHtml(agentPath);
+		const content = await this.client.readFile(agentPath);
+		if (content.truncated) {
+			throw new SessionImportError(
+				"Session export exceeds the 1MB read_file wire cap — export agent-side with /export while detached",
+			);
+		}
+		const localPath = outputPath ?? content.path.split("/").pop() ?? "session.html";
+		writeFileSync(localPath, content.content, "utf8");
+		return localPath;
 	}
 
 	exportToJsonl(_outputPath?: string): string {
@@ -908,23 +931,46 @@ export class RemoteAgentSession {
 				| Model<any>
 				| undefined,
 		// Provider capabilities mirrored from the agent's get_auth_status, so
-		// /login lists the agent's real providers; the login/logout actions
-		// themselves stay non-remotable and fail with a friendly error box.
-		getProviders: (): Array<{ id: string; name: string; auth: { oauth?: boolean; apiKey?: boolean } }> =>
+		// /login lists the agent's real providers. The auth entries must be
+		// METHOD-SHAPED objects, not booleans: the stock TUI checks
+		// method?.login truthiness to route API-key login (booleans send it to
+		// the ambient-auth dialog) and runs `"loginLabel" in method` for
+		// dual-method providers (which throws on a boolean). Login itself
+		// routes through modelRuntime.login → the RPC login command, so the
+		// method functions here are never invoked — presence is the contract.
+		getProviders: (): Array<{
+			id: string;
+			name: string;
+			auth: { oauth?: { loginLabel?: string; login: unknown }; apiKey?: { login: unknown } };
+		}> =>
 			this._authProviders.map((p) => ({
 				id: p.id,
 				name: p.name,
-				auth: { oauth: p.oauth || undefined, apiKey: p.apiKey || undefined },
+				auth: {
+					oauth: p.oauth ? { loginLabel: p.oauth.loginLabel, login: REMOTE_AUTH_METHOD_PRESENCE } : undefined,
+					apiKey: p.apiKey ? { login: REMOTE_AUTH_METHOD_PRESENCE } : undefined,
+				},
 			})),
 		getProvider: (
 			provider: string,
-		): { id: string; name: string; auth: { oauth?: boolean; apiKey?: boolean } } | undefined => {
+		):
+			| {
+					id: string;
+					name: string;
+					auth: { oauth?: { loginLabel?: string; login: unknown }; apiKey?: { login: unknown } };
+			  }
+			| undefined => {
 			const found = this._authProviders.find((p) => p.id === provider);
 			return found
 				? {
 						id: found.id,
 						name: found.name,
-						auth: { oauth: found.oauth || undefined, apiKey: found.apiKey || undefined },
+						auth: {
+							oauth: found.oauth
+								? { loginLabel: found.oauth.loginLabel, login: REMOTE_AUTH_METHOD_PRESENCE }
+								: undefined,
+							apiKey: found.apiKey ? { login: REMOTE_AUTH_METHOD_PRESENCE } : undefined,
+						},
 					}
 				: undefined;
 		},
@@ -1044,10 +1090,20 @@ export class RemoteAgentSession {
 		},
 	};
 
-	readonly agent: { signal: AbortSignal; transport: unknown; subscribe: () => () => void } = {
+	readonly agent: {
+		signal: AbortSignal;
+		transport: unknown;
+		subscribe: () => () => void;
+		abort: () => Promise<void>;
+	} = {
 		signal: this.abortController.signal,
 		transport: undefined as unknown,
 		subscribe: (): (() => void) => () => {},
+		// The TUI's interrupt path (Escape) calls agent.abort() — without it
+		// the keypress threw TypeError and killed the attach.
+		abort: async (): Promise<void> => {
+			await this.client.abort();
+		},
 	};
 
 	readonly sessionManager = {

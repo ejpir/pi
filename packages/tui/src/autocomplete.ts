@@ -760,10 +760,15 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				return [];
 			}
 
+			// A custom fileSearcher already scoped and ranked its results
+			// (agent-side fs_complete): re-scoring them against the RAW query
+			// would reject valid hits (e.g. "src/f" is not contiguous in
+			// "src/components/foo.ts"). Trust the searcher's order (score 1
+			// ties → stable sort preserves it).
 			const scoredEntries = entries
 				.map((entry) => ({
 					...entry,
-					score: fdQuery ? this.scoreEntry(entry.path, fdQuery, entry.isDirectory) : 1,
+					score: this.fileSearcher || !fdQuery ? 1 : this.scoreEntry(entry.path, fdQuery, entry.isDirectory),
 				}))
 				.filter((entry) => entry.score > 0);
 

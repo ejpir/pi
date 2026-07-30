@@ -18,8 +18,9 @@
  */
 
 import * as crypto from "node:crypto";
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { unlink } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
 import { VERSION } from "../../config.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
@@ -135,10 +136,19 @@ export class RpcServer {
 	// Connection lifecycle
 	// =========================================================================
 
+	/**
+	 * Connections replaced by a takeover. Their sockets close gracefully and
+	 * stay readable briefly — without this, queued/in-flight lines from the
+	 * old client would still EXECUTE (prompt, mutate, shutdown) even though
+	 * its responses are suppressed.
+	 */
+	private readonly supersededConnections = new WeakSet<RpcConnection>();
+
 	/** Attach a client. Takes over from any currently attached client. */
 	attachConnection(connection: RpcConnection): void {
 		const previous = this.connection;
 		if (previous && previous !== connection) {
+			this.supersededConnections.add(previous);
 			try {
 				previous.send({ type: "detached", reason: "takeover" });
 			} catch {
@@ -562,6 +572,17 @@ export class RpcServer {
 			return;
 		}
 
+		// A superseded (taken-over) connection must not execute anything — its
+		// replacement owns the agent now.
+		if (this.supersededConnections.has(connection)) {
+			const id =
+				typeof parsed === "object" && parsed !== null && "id" in parsed && typeof parsed.id === "string"
+					? parsed.id
+					: undefined;
+			connection.send(this.error(id, "superseded", "Connection superseded by a newer client"));
+			return;
+		}
+
 		if (
 			typeof parsed !== "object" ||
 			parsed === null ||
@@ -817,11 +838,53 @@ export class RpcServer {
 			}
 
 			case "switch_session": {
-				const result = await this.runtimeHost.switchSession(command.sessionPath);
-				if (!result.cancelled) {
-					await this.rebindSession();
+				try {
+					const result = await this.runtimeHost.switchSession(command.sessionPath, {
+						cwdOverride: command.cwdOverride,
+					});
+					if (!result.cancelled) {
+						await this.rebindSession();
+					}
+					return this.success(id, "switch_session", result);
+				} catch (switchError: unknown) {
+					if (switchError instanceof MissingSessionCwdError) {
+						// Structured, not fatal: the client reconstructs the typed
+						// error so the TUI can prompt for a cwd and retry with
+						// cwdOverride (stock /resume flow).
+						return {
+							id,
+							type: "response",
+							command: "switch_session",
+							success: false,
+							error: switchError.message,
+							missingCwd: switchError.issue,
+						};
+					}
+					throw switchError;
 				}
-				return this.success(id, "switch_session", result);
+			}
+
+			case "delete_session": {
+				// Delete only files the session listing itself surfaced: the
+				// client picks paths from list_sessions, and validating against
+				// that set keeps this command from becoming an arbitrary unlink.
+				const cwd = session.sessionManager.getCwd();
+				const known = new Set(
+					(await SessionManager.listAll())
+						.map((info) => info.path)
+						.concat(
+							(await SessionManager.list(cwd, session.sessionManager.getSessionDir())).map((info) => info.path),
+						),
+				);
+				if (!known.has(command.sessionPath)) {
+					return this.error(id, command.type, `Not a known session file: ${command.sessionPath}`);
+				}
+				const active = session.sessionManager.getSessionFile();
+				if (active && resolve(active) === resolve(command.sessionPath)) {
+					return this.error(id, command.type, "Cannot delete the currently active session");
+				}
+				await unlink(command.sessionPath);
+				return this.success(id, "delete_session");
 			}
 
 			case "fork": {
@@ -1025,8 +1088,10 @@ export class RpcServer {
 					providers: providers.map((provider) => ({
 						id: provider.id,
 						name: provider.name,
-						oauth: Boolean(provider.auth.oauth),
-						apiKey: Boolean(provider.auth.apiKey),
+						oauth: provider.auth.oauth
+							? { loginLabel: (provider.auth.oauth as { loginLabel?: string }).loginLabel }
+							: undefined,
+						apiKey: provider.auth.apiKey ? { login: true as const } : undefined,
 					})),
 					credentials: credentials.map((credential) => ({
 						providerId: credential.providerId,
@@ -1118,25 +1183,50 @@ export class RpcServer {
 					mkdirSync(sessionDir, { recursive: true });
 				}
 				const destinationPath = join(sessionDir, fileName);
-				const replacedExisting = existsSync(destinationPath);
-				writeFileSync(destinationPath, command.content, "utf8");
-				try {
-					const result = await this.runtimeHost.importFromJsonl(destinationPath, command.cwdOverride);
-					if (!result.cancelled) {
-						await this.rebindSession();
+				// Collision-safe commit: stage the upload under a unique temp
+				// name, move any pre-existing session aside, and only then let
+				// the import replace it. On ANY failure (or a cancelled
+				// before-switch), restore the original so a failed/clashing
+				// import can never destroy an existing session.
+				const tempPath = join(sessionDir, `.pi-import-${crypto.randomUUID()}.tmp`);
+				const backupPath = `${destinationPath}.pi-import-backup-${crypto.randomUUID()}`;
+				writeFileSync(tempPath, command.content, "utf8");
+				const hadExisting = existsSync(destinationPath);
+				if (hadExisting) {
+					renameSync(destinationPath, backupPath);
+				}
+				renameSync(tempPath, destinationPath);
+				const rollback = (): void => {
+					try {
+						unlinkSync(destinationPath);
+					} catch {
+						// Best effort.
 					}
-					return this.success(id, "import_session", result);
-				} catch (importError: unknown) {
-					// Don't leave a failed upload behind — unless it replaced a
-					// file that was already there (then the upload is all that
-					// remains and removing it would lose the session entirely).
-					if (!replacedExisting) {
+					if (hadExisting) {
 						try {
-							unlinkSync(destinationPath);
+							renameSync(backupPath, destinationPath);
 						} catch {
 							// Best effort.
 						}
 					}
+				};
+				try {
+					const result = await this.runtimeHost.importFromJsonl(destinationPath, command.cwdOverride);
+					if (result.cancelled) {
+						rollback();
+						return this.success(id, "import_session", result);
+					}
+					await this.rebindSession();
+					if (hadExisting) {
+						try {
+							unlinkSync(backupPath);
+						} catch {
+							// Best effort.
+						}
+					}
+					return this.success(id, "import_session", result);
+				} catch (importError: unknown) {
+					rollback();
 					if (importError instanceof MissingSessionCwdError) {
 						// Not an error for the wire: the client prompts for a cwd and
 						// retries with cwdOverride (stock /import flow).

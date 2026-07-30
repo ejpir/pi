@@ -313,6 +313,12 @@ export interface SessionPickerHooks {
 	listAll: SessionsLoader;
 	/** Rename a session. Defaults to opening the session file locally. */
 	renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
+	/**
+	 * Delete a session. Defaults to local trash/unlink — wrong for remote
+	 * sessions (agent paths may not exist client-side, and a colliding local
+	 * path would delete an unrelated file), so attach mode must provide this.
+	 */
+	deleteSession?: (sessionPath: string) => Promise<{ ok: boolean; error?: string }>;
 }
 
 /**
@@ -4856,6 +4862,7 @@ export class InteractiveMode {
 							const mgr = SessionManager.open(sessionFilePath);
 							mgr.appendSessionInfo(next);
 						}),
+					deleteSession: picker?.deleteSession,
 					showRenameHint: true,
 					keybindings: this.keybindings,
 				},

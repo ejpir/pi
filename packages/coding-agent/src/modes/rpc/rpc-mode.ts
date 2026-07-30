@@ -94,7 +94,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		for (const signal of signals) {
 			const handler = () => {
 				killTrackedDetachedChildren();
-				void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
+				const exitCode = signal === "SIGHUP" ? 129 : 143;
+				// Route through RpcServer.shutdown so runtimeHost.dispose() runs
+				// (session_shutdown hooks, extension cleanup); onShutdown reaches
+				// the local shutdown() for stdout flush and exit.
+				void server.shutdown(exitCode);
+				// Never let a hung dispose trap the process on a signal.
+				setTimeout(() => process.exit(exitCode), 5000).unref();
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));

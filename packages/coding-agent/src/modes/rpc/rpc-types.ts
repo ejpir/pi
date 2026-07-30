@@ -61,7 +61,8 @@ export type RpcCommand =
 	// Session
 	| { id?: string; type: "get_session_stats" }
 	| { id?: string; type: "export_html"; outputPath?: string }
-	| { id?: string; type: "switch_session"; sessionPath: string }
+	| { id?: string; type: "switch_session"; sessionPath: string; cwdOverride?: string }
+	| { id?: string; type: "delete_session"; sessionPath: string }
 	| { id?: string; type: "fork"; entryId: string }
 	| { id?: string; type: "clone" }
 	| { id?: string; type: "get_fork_messages" }
@@ -134,6 +135,7 @@ export const RPC_CAPABILITIES = [
 	"login",
 	"logout",
 	"import_session",
+	"delete_session",
 ] as const;
 export type RpcCapability = (typeof RPC_CAPABILITIES)[number];
 
@@ -146,8 +148,19 @@ export type RpcCapability = (typeof RPC_CAPABILITIES)[number];
 export interface RpcAuthStatus {
 	/** Providers currently authenticated via OAuth. */
 	oauthProviders: string[];
-	/** All providers with their auth capabilities. */
-	providers: Array<{ id: string; name: string; oauth: boolean; apiKey: boolean }>;
+	/**
+	 * All providers with their auth capabilities. Method entries mirror the
+	 * presence/shape of the agent's real method objects (functions obviously
+	 * can't cross the wire): the TUI checks `.login` truthiness and
+	 * `"loginLabel" in method`, so booleans here would misroute API-key login
+	 * to the ambient-auth dialog (and throw on the `in` check).
+	 */
+	providers: Array<{
+		id: string;
+		name: string;
+		oauth?: { loginLabel?: string };
+		apiKey?: { login: true };
+	}>;
 	/** Stored credentials (logout selector). */
 	credentials: Array<{ providerId: string; type: string }>;
 }
@@ -282,7 +295,14 @@ export type RpcResponse =
 	// Session
 	| { id?: string; type: "response"; command: "get_session_stats"; success: true; data: SessionStats }
 	| { id?: string; type: "response"; command: "export_html"; success: true; data: { path: string } }
-	| { id?: string; type: "response"; command: "switch_session"; success: true; data: { cancelled: boolean } }
+	| {
+			id?: string;
+			type: "response";
+			command: "switch_session";
+			success: true;
+			data: { cancelled: boolean };
+	  }
+	| { id?: string; type: "response"; command: "delete_session"; success: true }
 	| { id?: string; type: "response"; command: "fork"; success: true; data: { text: string; cancelled: boolean } }
 	| { id?: string; type: "response"; command: "clone"; success: true; data: { cancelled: boolean } }
 	| {
@@ -416,7 +436,19 @@ export type RpcResponse =
 	  }
 
 	// Error response (any command can fail)
-	| { id?: string; type: "response"; command: string; success: false; error: string };
+	| {
+			id?: string;
+			type: "response";
+			command: string;
+			success: false;
+			error: string;
+			/**
+			 * Structured MissingSessionCwdError payload (switch_session): lets the
+			 * client reconstruct the typed error so the TUI can run its
+			 * missing-cwd prompt/retry flow instead of treating it as fatal.
+			 */
+			missingCwd?: { sessionFile?: string; sessionCwd: string; fallbackCwd: string };
+	  };
 
 // ============================================================================
 // RPC Server Events (stdout, not tied to a command)

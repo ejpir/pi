@@ -3,7 +3,7 @@
  * a real RpcClient, and RemoteAgentSession + RemoteAgentSessionRuntime on top.
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
@@ -534,6 +534,158 @@ describe("RemoteAgentSession facade", () => {
 		mirror.applyMirror({ type: "message_end", message: last });
 		mirror._drainingPending = false;
 		expect(mirror._messages.length).toBe(before);
+	});
+
+	it("agent.abort() routes the TUI interrupt path over the wire", async () => {
+		const fixture = await startFixture({ suffix: "agent-abort", persisted: true });
+		const { remote } = await connectFacade(fixture);
+		// The TUI calls this.agent.abort() on Escape; the facade must expose it.
+		await remote.agent.abort();
+	});
+
+	it("fork with position 'at' uses clone semantics", async () => {
+		const fixtureA = await startFixture({ suffix: "clone-at", persisted: true });
+		await fixtureA.session.prompt("hello");
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+		const leafId = remote.sessionManager.getLeafId();
+		expect(leafId).toBeTruthy();
+
+		vi.mocked(fixtureA.runtimeHost.fork).mockResolvedValue({ cancelled: false, selectedText: "" });
+		const result = await runtime.fork(leafId!, { position: "at" });
+		expect(result.cancelled).toBe(false);
+		// The facade routed to the clone command, which re-enters the runtime
+		// with position "at" (wire fork defaults to "before" and would fail).
+		expect(fixtureA.runtimeHost.fork).toHaveBeenCalledWith(expect.any(String), { position: "at" });
+	});
+
+	it("exportToHtml lands on the CLIENT filesystem", async () => {
+		const fixtureA = await startFixture({ suffix: "export-local", persisted: true });
+		await fixtureA.session.prompt("hello");
+		const { remote } = await connectFacade(fixtureA);
+
+		const localPath = join(fixtureA.tempDir, "client-side-export.html");
+		const result = await remote.exportToHtml(localPath);
+		expect(result).toBe(localPath);
+		expect(existsSync(localPath)).toBe(true);
+		expect(readFileSync(localPath, "utf8").length).toBeGreaterThan(0);
+	});
+
+	it("switch_session surfaces missing cwd as a typed, retriable error", async () => {
+		const fixtureA = await startFixture({ suffix: "switch-mcwd", persisted: true });
+		const { client } = await connectFacade(fixtureA);
+		const { MissingSessionCwdError } = await import("../src/core/session-cwd.ts");
+
+		// The agent side throws the real typed error when no cwdOverride is
+		// given and accepts the retry that carries one.
+		vi.mocked(fixtureA.runtimeHost.switchSession).mockImplementation(
+			async (sessionPath: string, options?: { cwdOverride?: string }) => {
+				if (!options?.cwdOverride) {
+					throw new MissingSessionCwdError({
+						sessionFile: sessionPath,
+						sessionCwd: "/nonexistent-moved-cwd-xyz",
+						fallbackCwd: fixtureA.tempDir,
+					});
+				}
+				return { cancelled: false };
+			},
+		);
+
+		const error = await client.switchSession("/sessions/moved.jsonl").catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(MissingSessionCwdError);
+		expect((error as InstanceType<typeof MissingSessionCwdError>).issue.sessionCwd).toBe(
+			"/nonexistent-moved-cwd-xyz",
+		);
+
+		// The TUI's retry flow passes cwdOverride — the switch then succeeds.
+		const retry = await client.switchSession("/sessions/moved.jsonl", { cwdOverride: fixtureA.tempDir });
+		expect(retry.cancelled).toBe(false);
+		expect(vi.mocked(fixtureA.runtimeHost.switchSession).mock.calls[1]?.[1]).toEqual({
+			cwdOverride: fixtureA.tempDir,
+		});
+	});
+
+	it("delete_session deletes on the agent host and refuses unsafe targets", async () => {
+		const fixtureA = await startFixture({ suffix: "delete-session", persisted: true });
+		await fixtureA.session.prompt("hello");
+		const { client } = await connectFacade(fixtureA);
+
+		// A second session in the same directory is listed and deletable.
+		const sessionDir = fixtureA.session.sessionManager.getSessionDir();
+		const copyPath = join(sessionDir, "delete-me.jsonl");
+		writeFileSync(copyPath, readFileSync(fixtureA.session.sessionFile!, "utf8"), "utf8");
+		const listed = await client.listSessions(false);
+		expect(listed.some((s) => s.path === copyPath)).toBe(true);
+
+		await client.deleteSession(copyPath);
+		expect(existsSync(copyPath)).toBe(false);
+
+		// Unknown paths and the ACTIVE session are refused.
+		await expect(client.deleteSession(join(sessionDir, "not-there.jsonl"))).rejects.toThrow(/not a known session/i);
+		await expect(client.deleteSession(fixtureA.session.sessionFile!)).rejects.toThrow(/currently active/i);
+	});
+
+	it("a failed import can never destroy a same-named existing session", async () => {
+		const fixtureA = await startFixture({ suffix: "import-clash", persisted: true });
+		await fixtureA.session.prompt("hello");
+		const { client } = await connectFacade(fixtureA);
+
+		// Seed an existing session file under the name the upload will use.
+		const sessionDir = fixtureA.session.sessionManager.getSessionDir();
+		const clashPath = join(sessionDir, "clash.jsonl");
+		const original = readFileSync(fixtureA.session.sessionFile!, "utf8");
+		writeFileSync(clashPath, original, "utf8");
+
+		// Faithful importFromJsonl stand-in: sniff like the real runtime.
+		fixtureA.runtimeHost.importFromJsonl = (async (p: string) => {
+			const trimmed = readFileSync(p, "utf8").trimStart();
+			if (!trimmed.startsWith("{")) {
+				throw new SessionImportError("Not a session JSONL file — export with /export <file>.jsonl");
+			}
+			return { cancelled: false };
+		}) as unknown as AgentSessionRuntime["importFromJsonl"];
+
+		// Import junk that fails the sniff.
+		await expect(
+			client.importSession({ content: "<!DOCTYPE html><html>nope</html>\n", fileName: "clash.jsonl" }),
+		).rejects.toThrow(/not a session JSONL/i);
+
+		// The pre-existing session is byte-identical and no temp/backup files remain.
+		expect(readFileSync(clashPath, "utf8")).toBe(original);
+		const leftovers = readdirSync(sessionDir).filter(
+			(name) => name.includes(".pi-import-") || name.includes("backup"),
+		);
+		expect(leftovers).toEqual([]);
+	});
+
+	it("provider auth entries are method-shaped, not booleans", async () => {
+		const fixtureA = await startFixture({ suffix: "auth-shapes", persisted: true });
+		const { remote } = await connectFacade(fixtureA);
+		const providers = remote.modelRuntime.getProviders() as Array<{
+			id: string;
+			auth: { oauth?: unknown; apiKey?: unknown };
+		}>;
+		for (const provider of providers) {
+			if (provider.auth.oauth !== undefined) {
+				expect(typeof provider.auth.oauth).toBe("object");
+				expect(typeof (provider.auth.oauth as { login?: unknown }).login).toBe("function");
+			}
+			if (provider.auth.apiKey !== undefined) {
+				expect(typeof provider.auth.apiKey).toBe("object");
+				expect(typeof (provider.auth.apiKey as { login?: unknown }).login).toBe("function");
+			}
+		}
+		// Anthropic ships API-key auth in the builtin catalog — the shape must
+		// survive the wire for the TUI's method?.login check.
+		const anthropic = providers.find((p) => p.id === "anthropic");
+		if (anthropic?.auth.apiKey !== undefined) {
+			expect(typeof anthropic.auth.apiKey).toBe("object");
+		}
 	});
 
 	it("dedups several messages replayed from one refetch window", async () => {
