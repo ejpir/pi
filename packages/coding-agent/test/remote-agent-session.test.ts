@@ -11,7 +11,11 @@ import { type AssistantMessage, type AssistantMessageEvent, EventStream, getMode
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
-import { SessionImportFileNotFoundError, SessionImportUnsupportedError } from "../src/core/agent-session-runtime.ts";
+import {
+	SessionImportError,
+	SessionImportFileNotFoundError,
+	SessionImportUnsupportedError,
+} from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ExtensionFactory } from "../src/core/extensions/types.ts";
 import { MissingSessionCwdError } from "../src/core/session-cwd.ts";
@@ -397,7 +401,7 @@ describe("RemoteAgentSession facade", () => {
 		writeFileSync(htmlPath, "<!DOCTYPE html><html>...</html>", "utf8");
 
 		const error = await runtime.importFromJsonl(htmlPath).catch((e: unknown) => e);
-		expect(error).toBeInstanceOf(Error);
+		expect(error).toBeInstanceOf(SessionImportError);
 		expect((error as Error).message).toMatch(/not a session JSONL/i);
 	});
 
@@ -415,6 +419,7 @@ describe("RemoteAgentSession facade", () => {
 		writeFileSync(emptyPath, "", "utf8");
 
 		const error = await runtime.importFromJsonl(emptyPath).catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(SessionImportError);
 		expect((error as Error).message).toMatch(/empty/i);
 	});
 
@@ -434,6 +439,7 @@ describe("RemoteAgentSession facade", () => {
 		writeFileSync(join(fixtureA.tempDir, "binary-session.jsonl"), Buffer.from([0x89, 0x50, 0x00, 0x01]));
 
 		const error = await runtime.importFromJsonl("binary-session.jsonl").catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(SessionImportError);
 		expect((error as Error).message).toMatch(/agent host/);
 		expect((error as Error).message).toMatch(/binary file/i);
 		expect(error).not.toBeInstanceOf(SessionImportFileNotFoundError);
@@ -491,6 +497,7 @@ describe("RemoteAgentSession facade", () => {
 		writeFileSync(join(fixtureA.tempDir, "big-session.jsonl"), "{}\n".repeat(400_000));
 
 		const error = await runtime.importFromJsonl("big-session.jsonl").catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(SessionImportError);
 		expect((error as Error).message).toMatch(/too large/i);
 	});
 

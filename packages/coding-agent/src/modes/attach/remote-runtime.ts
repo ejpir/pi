@@ -14,6 +14,7 @@ import { basename } from "node:path";
 import type { AgentSession } from "../../core/agent-session.ts";
 import {
 	type AgentSessionRuntime,
+	SessionImportError,
 	SessionImportFileNotFoundError,
 	SessionImportUnsupportedError,
 } from "../../core/agent-session-runtime.ts";
@@ -141,7 +142,14 @@ export class RemoteAgentSessionRuntime {
 		let content: string;
 		let fileName: string;
 		if (existsSync(clientPath)) {
-			content = readFileSync(clientPath, "utf8");
+			// Every throw from here down must stay inside the SessionImportError
+			// hierarchy — anything else routes the stock handler to its fatal
+			// path and kills the attach for a recoverable condition.
+			try {
+				content = readFileSync(clientPath, "utf8");
+			} catch (error) {
+				throw new SessionImportError(error instanceof Error ? error.message : String(error));
+			}
 			fileName = basename(clientPath);
 		} else {
 			let agentFile: { path: string; content: string; truncated: boolean };
@@ -157,10 +165,10 @@ export class RemoteAgentSessionRuntime {
 				if (message.includes("File not found")) {
 					throw new SessionImportFileNotFoundError(clientPath);
 				}
-				throw new Error(`Failed to read ${inputPath} on the agent host: ${message}`);
+				throw new SessionImportError(`Failed to read ${inputPath} on the agent host: ${message}`);
 			}
 			if (agentFile.truncated) {
-				throw new Error(`Session file too large to import over the wire: ${agentFile.path}`);
+				throw new SessionImportError(`Session file too large to import over the wire: ${agentFile.path}`);
 			}
 			content = agentFile.content;
 			fileName = basename(agentFile.path);
@@ -172,10 +180,10 @@ export class RemoteAgentSessionRuntime {
 		// guard.)
 		const trimmed = content.trimStart();
 		if (trimmed.length === 0) {
-			throw new Error("Session file is empty");
+			throw new SessionImportError("Session file is empty");
 		}
 		if (!trimmed.startsWith("{")) {
-			throw new Error(
+			throw new SessionImportError(
 				"Not a session JSONL file — export with `/export <file>.jsonl` and import that (HTML exports are not importable)",
 			);
 		}
