@@ -688,6 +688,56 @@ describe("RemoteAgentSession facade", () => {
 		}
 	});
 
+	it("stamps message_end events with a per-session sequence matching the get_messages high-water mark", async () => {
+		const fixture = await startFixture({ suffix: "seq-stamp", persisted: true });
+		const { client } = await connectFacade(fixture);
+
+		const seqs: number[] = [];
+		client.onEvent((event) => {
+			if (event.type === "message_end") {
+				seqs.push((event as unknown as { seq?: number }).seq ?? -1);
+			}
+		});
+		await fixture.session.prompt("hello");
+
+		expect(seqs.length).toBeGreaterThan(0);
+		expect(seqs.every((seq) => seq > 0)).toBe(true);
+		// Monotonic in emission order.
+		expect([...seqs].sort((a, b) => a - b)).toEqual(seqs);
+
+		// The snapshot's high-water mark covers exactly the stamped events so
+		// far: a client draining queued events can drop seq <= high-water.
+		const snapshot = await client.getMessages();
+		expect(snapshot.messageSeq).toBe(seqs[seqs.length - 1]);
+		expect(snapshot.messages.length).toBeGreaterThan(0);
+	});
+
+	it("dedups drain replays by sequence identity against the snapshot high-water mark", async () => {
+		const fixture = await startFixture({ suffix: "seq-dedup", persisted: true });
+		const { remote } = await connectFacade(fixture);
+
+		const mirror = remote as unknown as {
+			applyMirror: (event: unknown) => void;
+			_messages: unknown[];
+			_drainingPending: boolean;
+			_snapshotSeq: number;
+		};
+		mirror._snapshotSeq = 10;
+
+		const replayed = { role: "user", content: [{ type: "text", text: "old" }], timestamp: 111 };
+		const fresh = { role: "user", content: [{ type: "text", text: "new" }], timestamp: 222 };
+
+		mirror._drainingPending = true;
+		const before = mirror._messages.length;
+		// At-or-below the high-water mark: in the snapshot, skip.
+		mirror.applyMirror({ type: "message_end", message: replayed, seq: 10 });
+		expect(mirror._messages.length).toBe(before);
+		// Above it: completed after the snapshot, apply.
+		mirror.applyMirror({ type: "message_end", message: fresh, seq: 11 });
+		expect(mirror._messages.length).toBe(before + 1);
+		mirror._drainingPending = false;
+	});
+
 	it("dedups several messages replayed from one refetch window", async () => {
 		// Two messages completing during a single refetch are BOTH in the
 		// fresh snapshot; draining their queued message_ends must skip both

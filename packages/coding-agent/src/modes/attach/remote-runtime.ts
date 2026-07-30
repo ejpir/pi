@@ -102,9 +102,7 @@ export class RemoteAgentSessionRuntime {
 
 	async switchSession(sessionPath: string, options?: { cwdOverride?: string }): Promise<{ cancelled: boolean }> {
 		const rebind = this.expectRebind();
-		// cwdOverride completes the missing-cwd retry: the client surfaces a
-		// reconstructed MissingSessionCwdError, the TUI prompts, and the retry
-		// carries the chosen cwd here.
+		// cwdOverride completes the TUI's missing-cwd retry.
 		const result = await this.client.switchSession(sessionPath, { cwdOverride: options?.cwdOverride });
 		if (!result.cancelled) await rebind;
 		return { cancelled: result.cancelled };
@@ -116,10 +114,8 @@ export class RemoteAgentSessionRuntime {
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
 		const rebind = this.expectRebind();
 		if (options?.position === "at") {
-			// /clone semantics: replace the current leaf. The wire fork command
-			// defaults to "before", which fails with "Invalid entry ID" whenever
-			// the leaf is an assistant/tool entry (i.e. always); the dedicated
-			// clone command forks the agent's own leaf with position "at".
+			// /clone semantics: wire fork defaults to "before", which fails on
+			// assistant/tool leaves; the clone command forks the leaf at "at".
 			const result = await this.client.clone();
 			if (!result.cancelled) await rebind;
 			return { cancelled: result.cancelled };
@@ -142,8 +138,7 @@ export class RemoteAgentSessionRuntime {
 	 * lands the TUI on the imported session.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
-		// Pre-flight: an agent running an older build (e.g. a stale baked
-		// container image) lacks import_session — say so plainly instead of
+		// An older agent build lacks import_session; say so plainly instead of
 		// surfacing the wire's "Unknown command" error.
 		if (!this.client.hasCapability("import_session")) {
 			throw new SessionImportUnsupportedError(
@@ -154,9 +149,8 @@ export class RemoteAgentSessionRuntime {
 		let content: string;
 		let fileName: string;
 		if (existsSync(clientPath)) {
-			// Every throw from here down must stay inside the SessionImportError
-			// hierarchy — anything else routes the stock handler to its fatal
-			// path and kills the attach for a recoverable condition.
+			// Every throw from here down must stay inside SessionImportError —
+			// anything else routes the stock handler to its fatal path.
 			try {
 				content = readFileSync(clientPath, "utf8");
 			} catch (error) {
@@ -168,11 +162,8 @@ export class RemoteAgentSessionRuntime {
 			try {
 				agentFile = await this.client.readFile(inputPath);
 			} catch (err) {
-				// Only a genuine miss becomes "not found" at the client path.
-				// read_file also fails with "Not a file"/"Binary file", and the
-				// RPC itself can time out or drop — those are agent-side errors
-				// and must surface as themselves, not as a misleading local
-				// "file not found".
+				// Only a genuine miss becomes "not found"; other read_file
+				// failures are agent-side errors and must surface as themselves.
 				const message = err instanceof Error ? err.message : String(err);
 				if (message.includes("File not found")) {
 					throw new SessionImportFileNotFoundError(clientPath);
@@ -186,10 +177,7 @@ export class RemoteAgentSessionRuntime {
 			fileName = basename(agentFile.path);
 		}
 
-		// Fail fast with a clear message for the common trap: /import reads
-		// JSONL session files; an HTML export is not importable. (Hoisted
-		// into the agent-side import too, so local /import gets the same
-		// guard.)
+		// Common trap: an HTML export is not importable. Same guard exists agent-side.
 		const trimmed = content.trimStart();
 		if (trimmed.length === 0) {
 			throw new SessionImportError("Session file is empty");
@@ -207,16 +195,12 @@ export class RemoteAgentSessionRuntime {
 		try {
 			result = await this.client.importSession({ content, fileName, cwdOverride });
 		} catch (error) {
-			// The stock import handler routes unclassified errors to
-			// handleFatalRuntimeError (process.exit) — survivable locally,
-			// but over the wire a transport timeout or an agent-side failure
-			// must not kill the attach. Report as unsupported: the TUI shows
-			// the message and stays alive.
+			// A transport timeout or agent-side failure must not kill the
+			// attach; wrapped, the TUI shows the message and stays alive.
 			throw new SessionImportUnsupportedError(error instanceof Error ? error.message : String(error));
 		}
 		if (result.missingCwd) {
-			// Reconstruct the typed error so the TUI's stock retry flow
-			// (prompt for a cwd, retry with cwdOverride) works unchanged.
+			// Reconstruct the typed error so the TUI's stock retry flow works unchanged.
 			throw new MissingSessionCwdError(result.missingCwd);
 		}
 		return { cancelled: result.cancelled };
@@ -241,21 +225,15 @@ export class RemoteAgentSessionRuntime {
 				clearTimeout(timer);
 				resolve();
 			};
-			// A second session-replacing call while one awaits its rebind:
-			// resolve the first waiter rather than stranding it for the full
-			// timeout — the upcoming rebind covers both.
+			// Resolve a previous waiter rather than stranding it; the upcoming
+			// rebind covers both.
 			const previous = this.rebindWaiter;
 			this.rebindWaiter = waiter;
 			previous?.();
 		});
 	}
 
-	/**
-	 * Rebind the TUI after the client reconnected to a (restarted) agent:
-	 * invalidate session-derived UI state, refetch the mirror from the new
-	 * server, then rebind. The session on the other end may be a brand-new
-	 * one or the same session file resumed — the mirror reflects either.
-	 */
+	/** Rebind the TUI after reconnecting to a (possibly restarted) agent. */
 	async handleReconnect(): Promise<void> {
 		await this.handleSessionChanged();
 	}
@@ -266,9 +244,8 @@ export class RemoteAgentSessionRuntime {
 			await this.remoteSession.refetchAll();
 			await this.rebindCb?.(this.session);
 		} catch (rebindError: unknown) {
-			// Rebind failures must not kill the event loop; the mirror is
-			// already refetched, so the TUI stays usable. Still log — a silent
-			// failure here otherwise presents as a mysteriously stale TUI.
+			// The TUI stays usable; log so a failure doesn't present as a
+			// mysteriously stale TUI.
 			console.error(
 				"attach: session rebind failed:",
 				rebindError instanceof Error ? rebindError.message : rebindError,
@@ -278,9 +255,7 @@ export class RemoteAgentSessionRuntime {
 
 	private async handleSessionChanged(): Promise<void> {
 		if (this.rebinding) {
-			// A second session change raced the in-flight rebind: coalesce it
-			// and re-run once, so the TUI never stays bound to an intermediate
-			// session. The waiter is still signalled below.
+			// Coalesce changes racing an in-flight rebind; re-run once below.
 			this.rebindPending = true;
 			return;
 		}

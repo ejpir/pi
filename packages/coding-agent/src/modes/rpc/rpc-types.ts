@@ -336,7 +336,19 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "set_session_name"; success: true }
 
 	// Messages
-	| { id?: string; type: "response"; command: "get_messages"; success: true; data: { messages: AgentMessage[] } }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_messages";
+			success: true;
+			/**
+			 * messages plus the message_end sequence HIGH-WATER MARK: every
+			 * message_end event stamped seq <= messageSeq completed before
+			 * this snapshot was taken and is included in it. message_end
+			 * events carry the stamp as a `seq` field on the wire event.
+			 */
+			data: { messages: AgentMessage[]; messageSeq?: number };
+	  }
 
 	// Commands
 	| {

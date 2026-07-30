@@ -44,8 +44,7 @@ function toSessionInfo(entry: RpcSessionInfo): SessionInfo {
 		modified: new Date(entry.modified),
 		messageCount: entry.messageCount,
 		firstMessage: entry.firstMessage,
-		// Full-message search text is not carried over the wire; the picker
-		// searches names/first messages only in attach mode.
+		// Full-message text is not carried over the wire; search names/first messages only.
 		allMessagesText: entry.firstMessage,
 	};
 }
@@ -63,8 +62,6 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 	);
 	await client.start();
 
-	// Everything between start() and the interactive run must not leak the
-	// spawned agent process / socket connection on failure.
 	const stopClientQuietly = async (): Promise<void> => {
 		await client.stop().catch(() => {});
 	};
@@ -100,12 +97,8 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 	let exitScheduled = false;
 	let interactiveRef: InteractiveMode | undefined;
 
-	/**
-	 * Forced teardown for server-pushed detach (takeover, connection lost).
-	 * InteractiveMode.stop() restores the terminal but does NOT settle run()
-	 * (its pending input never resolves), so the only reliable way out is
-	 * process exit — consistent with every other TUI exit path.
-	 */
+	// Server-pushed teardown. InteractiveMode.stop() restores the terminal but
+	// never settles run(), so process exit is the only reliable way out.
 	const forceExit = (reason: string, exitCode: number): void => {
 		if (exitScheduled) return;
 		exitScheduled = true;
@@ -121,11 +114,8 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 	};
 
 	remote.onDetached = (reason) => {
-		// Server-initiated: takeover means another client owns the agent now —
-		// exit immediately. A graceful shutdown is followed by a CLEAN transport
-		// close (error === null), which the reconnect loop below would treat as
-		// "not a failure" and ignore — so exit here too. tuiStopped guards our
-		// own exit flow (we sent the shutdown ourselves).
+		// A graceful shutdown ends in a clean close the reconnect loop would
+		// ignore, so exit here; tuiStopped means we sent the shutdown ourselves.
 		if (reason === "takeover") {
 			forceExit(reason, 2);
 		} else if (reason === "shutdown" && !tuiStopped) {
@@ -133,16 +123,12 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 		}
 	};
 
-	// Reconnect loop: when the socket drops (agent restarted, crashed, or
-	// shut down), keep redialing. A restarted agent gets a fresh mirror and
-	// the TUI rebinds to whatever session the new server holds.
+	// Redial on transport drop; a restarted agent gets a fresh mirror.
 	let reconnecting = false;
 	client.onClose(() => {
 		if (tuiStopped || reconnecting) return;
-		// A close without a preceding detached event — clean closes included,
-		// e.g. a --cmd bridge exiting 0 after the agent behind it crashed —
-		// means the transport died underneath us. Treat it as connection loss
-		// and redial like any other drop.
+		// Any close without a preceding detached event — clean ones included —
+		// means the transport died underneath us.
 		reconnecting = true;
 		void (async () => {
 			const deadline = Date.now() + 30_000;
@@ -179,9 +165,7 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 			await client.renameSession(sessionPath, next);
 		},
 		deleteSession: async (sessionPath) => {
-			// Delete on the AGENT host: the picker's paths name agent-side files.
-			// Local trash/unlink would falsely report success for absent paths or
-			// delete an unrelated client file on a path collision.
+			// Picker paths name agent-side files; delete there, never locally.
 			try {
 				await client.deleteSession(sessionPath);
 				return { ok: true };
@@ -193,9 +177,7 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 
 	const interactive = new InteractiveMode(asAgentSessionRuntime(runtime), {
 		sessionPicker,
-		// @-completion queries the AGENT's filesystem over fs_complete —
-		// the agent's cwd (e.g. /work in a container) usually doesn't exist
-		// on the attach host, so the default fd walker finds nothing there.
+		// @-completion must query the agent's filesystem, not the attach host's.
 		fileCompletion: async (query, { signal }) => {
 			try {
 				const entries = await client.fsComplete(query);
@@ -208,8 +190,7 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 	});
 	interactiveRef = interactive;
 	if (exitScheduled) {
-		// Takeover raced ahead of TUI startup; forceExit already fired but had
-		// no TUI to restore — stop() now for a clean terminal before exiting.
+		// Takeover raced ahead of startup; restore the terminal before the exit lands.
 		interactive.stop();
 	}
 
@@ -219,7 +200,6 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 		tuiStopped = true;
 		stopThemeWatcher();
 		if (detachReason) {
-			// The server pushed us off (takeover or shutdown); transport is gone.
 			console.error(`\nDetached from agent: ${detachReason}`);
 		} else if (options.command) {
 			// Per-attach agent: it is ours, shut it down with the session.

@@ -112,6 +112,14 @@ export class RpcServer {
 	private readonly refreshTimeoutMs: number;
 	/** Coalesces concurrent refresh_models calls onto one agent-side refresh. */
 	private pendingModelRefresh: Promise<unknown> | undefined;
+	/**
+	 * Per-session monotonic sequence stamped onto message_end events. The
+	 * get_messages response carries the current high-water mark, so a client
+	 * refetching mid-stream can tell replayed events (seq <= high-water,
+	 * already in the snapshot) from genuinely new ones — identity, not
+	 * structural comparison. Reset on every session rebind.
+	 */
+	private messageSeq = 0;
 	private shuttingDown = false;
 	private detachGraceMs: number;
 	private runtimeHost: AgentSessionRuntime;
@@ -428,6 +436,9 @@ export class RpcServer {
 	}
 
 	private rebindSession = async (): Promise<void> => {
+		// Per-session sequence restarts (history messages have no seq — they
+		// are simply present in every snapshot).
+		this.messageSeq = 0;
 		this.session = this.runtimeHost.session;
 		const session = this.session;
 		await session.bindExtensions({
@@ -471,7 +482,16 @@ export class RpcServer {
 
 		this.unsubscribe?.();
 		this.unsubscribe = session.subscribe((event) => {
-			this.output(event);
+			// The subscribe callback fires after the agent appended the
+			// message, and get_messages reads the same array synchronously —
+			// so seq increments and snapshot reads can never disagree about
+			// inclusion.
+			if (event.type === "message_end") {
+				this.messageSeq++;
+				this.output({ ...event, seq: this.messageSeq });
+			} else {
+				this.output(event);
+			}
 			if (event.type === "agent_settled") {
 				void this.checkShutdownRequested();
 			}
@@ -949,7 +969,7 @@ export class RpcServer {
 			// =================================================================
 
 			case "get_messages": {
-				return this.success(id, "get_messages", { messages: session.messages });
+				return this.success(id, "get_messages", { messages: session.messages, messageSeq: this.messageSeq });
 			}
 
 			// =================================================================

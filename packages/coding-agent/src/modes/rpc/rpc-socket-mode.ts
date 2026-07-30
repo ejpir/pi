@@ -68,8 +68,7 @@ function createSocketConnection(socket: Socket): RpcConnection {
 			socket.once("close", cb);
 		},
 		close: () => {
-			// Flush queued writes before ending so a final message (e.g. the
-			// takeover notice) is not lost.
+			// Flush queued writes so a final message (e.g. the takeover notice) is not lost.
 			void writeChain.then(() => {
 				if (!socket.destroyed && !socket.writableEnded) socket.end();
 			});
@@ -91,9 +90,7 @@ async function claimSocketPath(socketPath: string): Promise<void> {
 		const probe = new Socket();
 		probe.once("error", (err: NodeJS.ErrnoException) => {
 			if (err.code === "ECONNREFUSED" || err.code === "ENOENT") {
-				// Stale socket (or nothing there): safe to remove — but ONLY if
-				// it is actually a socket. Connecting to a regular file also
-				// yields ECONNREFUSED, and deleting that would destroy user data.
+				// ECONNREFUSED also comes from regular files; only ever unlink a socket.
 				try {
 					const stat = lstatSync(socketPath);
 					if (!stat.isSocket()) {
@@ -136,8 +133,7 @@ async function claimSocketPath(socketPath: string): Promise<void> {
 function cleanupSocketFile(socketPath: string): void {
 	if (process.platform === "win32") return;
 	try {
-		// Fail closed: a same-path replacement that is not a socket is not
-		// ours to delete.
+		// A same-path replacement that is not a socket is not ours to delete.
 		if (!lstatSync(socketPath).isSocket()) return;
 		unlinkSync(socketPath);
 	} catch {
@@ -170,8 +166,7 @@ export async function createRpcSocketServer(
 				current.close(() => resolve());
 				// close() only fires once all connections end; don't wait forever.
 				setTimeout(resolve, 2000).unref();
-				// Destroy accepted connections: mirrors process-exit semantics and
-				// lets peers observe the close (in-process restarts, tests).
+				// Destroy accepted connections so peers observe the close.
 				for (const connection of connections) {
 					connection.destroy();
 				}
@@ -196,19 +191,16 @@ export async function createRpcSocketServer(
 	await claimSocketPath(socketPath);
 
 	listener = createServer((socket) => {
-		// Never let a misbehaving or abruptly-reset peer crash the server:
-		// 'error' (e.g. ECONNRESET) is always followed by 'close', which
-		// drives the connection-loss path in RpcServer.
+		// A peer reset must never crash the server: 'error' (e.g. ECONNRESET)
+		// is always followed by 'close', which drives the connection-loss path.
 		connections.add(socket);
 		socket.on("close", () => connections.delete(socket));
 		socket.on("error", () => {});
 		rpcServer.attachConnection(createSocketConnection(socket));
 	});
 
-	// The socket grants full agent control with no authentication, so it must
-	// never be world-accessible: apply a restrictive umask around listen() so
-	// the socket node is created 0600 (no race window), then chmod as a
-	// belt-and-braces fix for filesystems that ignore umask.
+	// The socket grants full agent control: umask around listen() creates it
+	// 0600 with no race window; chmod covers filesystems that ignore umask.
 	const previousUmask = process.platform !== "win32" ? process.umask(0o077) : 0;
 	try {
 		await new Promise<void>((resolve, reject) => {
@@ -244,8 +236,6 @@ export async function runRpcSocketMode(
 	const shutdown = async (exitCode: number): Promise<never> => {
 		if (!shuttingDown) {
 			shuttingDown = true;
-			// Listener close happens via the socket server's onShutdown chain
-			// (or here for signal-driven shutdown).
 			await socketServer?.close();
 		}
 		process.exit(exitCode);
@@ -264,9 +254,7 @@ export async function runRpcSocketMode(
 		process.on(signal, () => {
 			killTrackedDetachedChildren();
 			const exitCode = signal === "SIGHUP" ? 129 : 143;
-			// Route through RpcServer.shutdown so runtimeHost.dispose() runs
-			// (session_shutdown hooks, extension cleanup); onShutdown reaches
-			// the local shutdown() for listener cleanup and exit.
+			// Route through RpcServer.shutdown so runtimeHost.dispose() runs.
 			void socketServer?.server.shutdown(exitCode);
 			// Never let a hung dispose trap the process on a signal.
 			setTimeout(() => process.exit(exitCode), 5000).unref();

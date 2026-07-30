@@ -93,10 +93,8 @@ export interface ModelInfo {
 }
 
 /**
- * Events emitted by the server outside of command responses: the live
- * AgentSession event stream plus server-level lifecycle/UI events.
- * Consumers should narrow on `event.type`. Additive; the legacy listener
- * type below stays unchanged for compatibility.
+ * Events emitted outside command responses: the live AgentSession stream
+ * plus server lifecycle/UI events. Narrow on `event.type`.
  */
 export type RpcServerEvent =
 	| AgentSessionEvent
@@ -125,12 +123,9 @@ export class RpcClient {
 	private stopReading: (() => void) | null = null;
 	private eventListeners: RpcEventListener[] = [];
 	/**
-	 * Events that arrive between the hello response and the first onEvent
-	 * registration (the server re-emits pending extension dialogs immediately
-	 * after hello; attach-mode registers its listener only after start()
-	 * resolves). Buffering keeps a coalesced dialog event from being dropped
-	 * while the listener list is empty, which would leave the agent awaiting
-	 * an answer forever. Flushed on the first onEvent; capped defensively.
+	 * Events that arrive before the first onEvent registration (the server
+	 * re-emits pending extension dialogs right after hello). Dropping one
+	 * would leave the agent awaiting an answer forever.
 	 */
 	private earlyEvents: AgentSessionEvent[] = [];
 	private listenersEverRegistered = false;
@@ -191,8 +186,7 @@ export class RpcClient {
 				}
 			}
 		} catch (startError: unknown) {
-			// Handshake failed: tear down the half-open transport instead of
-			// leaking the process/socket.
+			// Handshake failed: don't leak the half-open transport.
 			this.stopping = true;
 			this.stopReading?.();
 			this.stopReading = null;
@@ -340,11 +334,9 @@ export class RpcClient {
 	}
 
 	/**
-	 * Re-dial the agent after the socket connection was lost (e.g. the agent
-	 * process was restarted). Socket transports only. Event and close
-	 * listeners survive the reconnect; in-flight requests were already
-	 * rejected when the connection dropped. Resolves after the new
-	 * connection's hello handshake completes.
+	 * Re-dial after the transport was lost. Event and close listeners survive;
+	 * in-flight requests were already rejected on the drop. Resolves after the
+	 * new connection's hello completes.
 	 */
 	async reconnect(): Promise<void> {
 		if (!this.options.socketPath && !this.options.command) {
@@ -356,8 +348,7 @@ export class RpcClient {
 		this.stopReading?.();
 		this.stopReading = null;
 		if (this.socket && !this.socket.destroyed) {
-			// Half-open transport (e.g. connected but hello never completed):
-			// destroy before re-dialing so it cannot linger or fire stale events.
+			// Destroy a half-open transport so it cannot fire stale events.
 			this.socket.destroy();
 		}
 		this.socket = null;
@@ -412,9 +403,7 @@ export class RpcClient {
 			socket.destroy();
 			this.socket = null;
 			this.writer = null;
-			// Settle everything: reject in-flight requests and notify close
-			// listeners (intentional stop → null error). The async 'close'
-			// event early-returns because this.socket no longer matches.
+			// Settle in-flight requests and close listeners (intentional stop → null error).
 			this.handleTransportClosed(null);
 			return;
 		}
@@ -455,8 +444,7 @@ export class RpcClient {
 
 		this.process = null;
 		this.writer = null;
-		// The 'exit' handler may have already run (reporting a null error when
-		// stopping); handleTransportClosed is idempotent per transport.
+		// handleTransportClosed is idempotent per transport.
 		this.handleTransportClosed(null);
 	}
 
@@ -703,8 +691,7 @@ export class RpcClient {
 		const response = await this.send({ type: "switch_session", sessionPath, cwdOverride: options?.cwdOverride });
 		if (!response.success) {
 			if (response.missingCwd) {
-				// Reconstruct the typed error so the TUI runs its missing-cwd
-				// prompt and retries with cwdOverride (stock /resume flow).
+				// Reconstruct the typed error so the TUI's missing-cwd retry flow works.
 				throw new MissingSessionCwdError(response.missingCwd);
 			}
 			throw new Error(response.error);
@@ -775,11 +762,13 @@ export class RpcClient {
 	}
 
 	/**
-	 * Get all messages in the session.
+	 * Get all messages in the session plus the message_end sequence
+	 * high-water mark (0 for older servers that don't stamp sequences).
 	 */
-	async getMessages(): Promise<AgentMessage[]> {
+	async getMessages(): Promise<{ messages: AgentMessage[]; messageSeq: number }> {
 		const response = await this.send({ type: "get_messages" });
-		return this.getData<{ messages: AgentMessage[] }>(response).messages;
+		const data = this.getData<{ messages: AgentMessage[]; messageSeq?: number }>(response);
+		return { messages: data.messages, messageSeq: data.messageSeq ?? 0 };
 	}
 
 	/**
@@ -875,7 +864,6 @@ export class RpcClient {
 	 * correlated by the given request id — register handlers BEFORE calling.
 	 */
 	async loginWithId(id: string, provider: string, method: "api_key" | "oauth"): Promise<void> {
-		// Interactive flow: the user may take minutes to accept a device code;
 		// 15min matches common device-flow expiries.
 		const response = await this.sendWithId(id, { type: "login", provider, method }, 15 * 60_000);
 		if (!response.success) {
@@ -921,10 +909,8 @@ export class RpcClient {
 
 	/** Refresh model availability (network fetch of provider catalogs). */
 	async refreshModels(): Promise<void> {
-		// Network-bound agent-side (registry + provider endpoints), so carry
-		// a wider budget than the 30s default. The server additionally
-		// bounds the refresh itself (refreshTimeoutMs), so this mostly
-		// covers a congested command queue.
+		// Network-bound on the agent side; the server bounds the refresh itself,
+		// so this budget mostly covers a congested command queue.
 		this.getData(await this.sendWithId(`req_${++this.requestId}`, { type: "refresh_models" }, 180_000));
 	}
 
@@ -1087,17 +1073,14 @@ export class RpcClient {
 			pending.resolve(data as unknown as RpcResponse);
 			return;
 		}
-		// Buffer events that race the first listener registration (see
-		// earlyEvents): dropping a pending extension dialog here leaves the
-		// agent awaiting an answer forever.
+		// Buffer events that race the first listener registration (see earlyEvents).
 		if (!this.listenersEverRegistered && this.eventListeners.length === 0) {
 			if (this.earlyEvents.length < 1000) {
 				this.earlyEvents.push(data as unknown as AgentSessionEvent);
 			}
 			return;
 		}
-		// Otherwise it's an event: deliver to every listener even when one
-		// throws (a throwing listener must not starve the rest).
+		// A throwing listener must not starve the rest.
 		for (const listener of this.eventListeners) {
 			try {
 				listener(data as unknown as AgentSessionEvent);
@@ -1156,10 +1139,8 @@ export class RpcClient {
 	}
 
 	/**
-	 * Send a void command and throw its error response. getData() only
-	 * guards methods that read a payload — a bare `await this.send(...)`
-	 * silently discards `success: false`, making e.g. a failed rename look
-	 * successful in the session picker.
+	 * Send a void command and throw its error response — a bare send()
+	 * discards `success: false`, making e.g. a failed rename look successful.
 	 */
 	private async sendChecked(command: RpcCommandBody): Promise<void> {
 		this.getData(await this.send(command));

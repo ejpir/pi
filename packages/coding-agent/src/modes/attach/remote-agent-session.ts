@@ -203,7 +203,10 @@ export class RemoteAgentSession {
 		if (hello && hello.sessionId === state.sessionId) {
 			this._cwd = hello.cwd;
 		}
-		this._messages = messages;
+		this._messages = messages.messages;
+		// High-water mark for drain dedup: queued message_end events stamped
+		// seq <= snapshotSeq completed before this snapshot and are included.
+		this._snapshotSeq = messages.messageSeq;
 		this._systemPrompt = systemPrompt;
 		this._contextUsage = usage;
 		this._tools = tools;
@@ -238,6 +241,8 @@ export class RemoteAgentSession {
 	private _authRequestCounter = 0;
 	private _pendingEvents: RpcServerEvent[] = [];
 	private _drainingPending = false;
+	/** message_end sequence high-water of the last snapshot (0 = legacy server). */
+	private _snapshotSeq = 0;
 
 	private routeEvent(event: RpcServerEvent): void {
 		if (this._refetching > 0) {
@@ -327,13 +332,12 @@ export class RemoteAgentSession {
 					// Replay hazard, drain-only: messages that completed while a
 					// refetch was in flight are already in the fresh snapshot,
 					// so queued message_ends replaying on top would double-render
-					// them. Matching is EXACT (role + ms timestamp + serialized
-					// content) — a replay is byte-identical to its snapshot copy,
-					// so a genuinely new message can never false-positive, and a
-					// whole-array scan covers several messages completing within
-					// one refetch window. Never apply outside the drain window.
+					// them. Sequenced servers make this an IDENTITY check
+					// (seq <= snapshot high-water); legacy servers fall back to
+					// exact structural matching (a replay is byte-identical to
+					// its snapshot copy). Never apply outside the drain window.
 					const message = e.message as AgentMessage;
-					if (!this._drainingPending || !this.isMirroredMessage(message)) {
+					if (!this._drainingPending || !this.isReplayedMessageEnd(message, e.seq as number | undefined)) {
 						this._messages.push(message);
 					}
 				}
@@ -374,6 +378,18 @@ export class RemoteAgentSession {
 	}
 
 	/** Drain-only replay check: is this exact message already in the mirror? */
+	/**
+	 * Drain-window replay detection for message_end. Sequenced servers: pure
+	 * identity (at-or-below the snapshot's high-water mark). Legacy servers:
+	 * exact structural match against the whole mirror.
+	 */
+	private isReplayedMessageEnd(message: AgentMessage, seq: number | undefined): boolean {
+		if (typeof seq === "number") {
+			return seq <= this._snapshotSeq;
+		}
+		return this.isMirroredMessage(message);
+	}
+
 	private isMirroredMessage(message: AgentMessage): boolean {
 		const incoming = message as { role?: string; timestamp?: number };
 		const serialized = JSON.stringify(message);
