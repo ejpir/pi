@@ -634,7 +634,8 @@ export class RpcClient {
 	 * callers can correlate streamed output chunks with this call.
 	 */
 	async bashWithId(id: string, command: string, excludeFromContext?: boolean): Promise<BashResult> {
-		const response = await this.sendWithId(id, { type: "bash", command, excludeFromContext });
+		// Bash may run for a long time; abort_bash (Escape) is the cancel path.
+		const response = await this.sendWithId(id, { type: "bash", command, excludeFromContext }, 60 * 60_000);
 		return this.getData(response);
 	}
 
@@ -828,7 +829,9 @@ export class RpcClient {
 	 * correlated by the given request id — register handlers BEFORE calling.
 	 */
 	async loginWithId(id: string, provider: string, method: "api_key" | "oauth"): Promise<void> {
-		const response = await this.sendWithId(id, { type: "login", provider, method });
+		// Interactive flow: the user may take minutes to accept a device code;
+		// 15min matches common device-flow expiries.
+		const response = await this.sendWithId(id, { type: "login", provider, method }, 15 * 60_000);
 		if (!response.success) {
 			throw new Error(response.error);
 		}
@@ -841,7 +844,7 @@ export class RpcClient {
 
 	/** Remove a stored credential on the agent host and refresh its models. */
 	async logout(provider: string): Promise<void> {
-		const response = await this.send({ type: "logout", provider });
+		const response = await this.sendWithId(`req_${++this.requestId}`, { type: "logout", provider }, 120_000);
 		if (!response.success) {
 			throw new Error(response.error);
 		}
@@ -857,7 +860,7 @@ export class RpcClient {
 		fileName: string;
 		cwdOverride?: string;
 	}): Promise<{ cancelled: boolean; missingCwd?: { sessionFile?: string; sessionCwd: string; fallbackCwd: string } }> {
-		const response = await this.send({ type: "import_session", ...params });
+		const response = await this.sendWithId(`req_${++this.requestId}`, { type: "import_session", ...params }, 300_000);
 		if (!response.success) {
 			throw new Error(response.error);
 		}
@@ -1093,7 +1096,7 @@ export class RpcClient {
 		return this.sendWithId(`req_${++this.requestId}`, command);
 	}
 
-	private async sendWithId(id: string, command: RpcCommandBody): Promise<RpcResponse> {
+	private async sendWithId(id: string, command: RpcCommandBody, timeoutMs = 30_000): Promise<RpcResponse> {
 		if (this.pendingRequests.has(id)) {
 			throw new Error(`Duplicate in-flight request id: ${id}`);
 		}
@@ -1103,7 +1106,7 @@ export class RpcClient {
 			const timeout = setTimeout(() => {
 				this.pendingRequests.delete(id);
 				reject(new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.stderr}`));
-			}, 30000);
+			}, timeoutMs);
 
 			this.pendingRequests.set(id, {
 				resolve: (response) => {
