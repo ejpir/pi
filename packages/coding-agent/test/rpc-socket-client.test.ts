@@ -136,6 +136,57 @@ describe("RpcClient over unix socket", () => {
 		}
 	});
 
+	it("reconnect() respawns a command transport after it dies", async () => {
+		const { mkdtempSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const dir = mkdtempSync(join(tmpdir(), "rpc-cmd-reconnect-"));
+		const serverPath = join(dir, "mini-rpc.js");
+		writeFileSync(
+			serverPath,
+			`let buf = "";
+process.stdin.on("data", (d) => {
+	buf += d;
+	let i;
+	while ((i = buf.indexOf("\\n")) >= 0) {
+		const line = buf.slice(0, i);
+		buf = buf.slice(i + 1);
+		const o = JSON.parse(line);
+		process.stdout.write(
+			JSON.stringify({ id: o.id, type: "response", command: o.type, success: true, data: { output: "ok" } }) + "\\n",
+		);
+	}
+});
+process.stdout.write(
+	JSON.stringify({
+		type: "hello",
+		protocol: 1,
+		version: "test",
+		sessionId: "cmd-session",
+		capabilities: [],
+		cwd: process.cwd(),
+		resumed: false,
+		state: {},
+	}) + "\\n",
+);
+`,
+		);
+
+		const client = new RpcClient({ command: `node ${JSON.stringify(serverPath)}` });
+		await client.start();
+		expect(client.getHello()?.sessionId).toBe("cmd-session");
+
+		// Kill the bridge process, then reconnect: a fresh spawn must handshake.
+		(client as unknown as { process: { kill: () => void } }).process.kill();
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		await client.reconnect();
+		expect(client.getHello()?.sessionId).toBe("cmd-session");
+		const result = await client.bash("true");
+		expect(result.output).toBe("ok");
+
+		await client.stop();
+	});
+
 	it("start() resolves after the hello handshake", async () => {
 		await startFixture();
 		const client = newClient();

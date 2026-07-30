@@ -336,10 +336,10 @@ export class RpcClient {
 	 * connection's hello handshake completes.
 	 */
 	async reconnect(): Promise<void> {
-		if (!this.options.socketPath) {
-			throw new Error("reconnect is only supported for socket transports");
+		if (!this.options.socketPath && !this.options.command) {
+			throw new Error("reconnect is only supported for socket/command transports");
 		}
-		if (this.socket && !this.socket.destroyed && this.hello) {
+		if (this.options.socketPath && this.socket && !this.socket.destroyed && this.hello) {
 			return; // still connected
 		}
 		this.stopReading?.();
@@ -350,6 +350,11 @@ export class RpcClient {
 			this.socket.destroy();
 		}
 		this.socket = null;
+		if (this.process && this.process.exitCode === null) {
+			// Bridge/spawned transport still running: kill before respawning.
+			this.process.kill();
+		}
+		this.process = null;
 		this.writer = null;
 		this.exitError = null;
 		this.hello = undefined;
@@ -357,7 +362,11 @@ export class RpcClient {
 		this.stopping = false;
 		this.transportClosedNotified = false;
 
-		this.startSocket(this.options.socketPath);
+		if (this.options.socketPath) {
+			this.startSocket(this.options.socketPath);
+		} else {
+			this.startProcess();
+		}
 		if (this.options.requireHello ?? true) {
 			await this.waitForHello();
 		}
