@@ -24,6 +24,8 @@ import type { ContextUsage, ToolInfo } from "../../core/extensions/types.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
+	RpcAuthNotifyEvent,
+	RpcAuthPromptEvent,
 	RpcAuthStatus,
 	RpcCommand,
 	RpcDetachedEvent,
@@ -100,7 +102,9 @@ export type RpcServerEvent =
 	| RpcSessionChangedEvent
 	| RpcDetachedEvent
 	| RpcExtensionUIRequest
-	| RpcExtensionErrorEvent;
+	| RpcExtensionErrorEvent
+	| RpcAuthPromptEvent
+	| RpcAuthNotifyEvent;
 
 export type RpcEventListener = (event: AgentSessionEvent) => void;
 
@@ -816,6 +820,48 @@ export class RpcClient {
 	async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
 		const response = await this.send({ type: "clear_queue" });
 		return this.getData<{ steering: string[]; followUp: string[] }>(response);
+	}
+
+	/**
+	 * Run a provider login flow on the agent host. While in flight, the server
+	 * emits auth_prompt (answer via respondAuthPrompt) and auth_notify events
+	 * correlated by the given request id — register handlers BEFORE calling.
+	 */
+	async loginWithId(id: string, provider: string, method: "api_key" | "oauth"): Promise<void> {
+		const response = await this.sendWithId(id, { type: "login", provider, method });
+		if (!response.success) {
+			throw new Error(response.error);
+		}
+	}
+
+	/** Answer an auth_prompt event. */
+	respondAuthPrompt(requestId: string, response: { value?: string; cancelled?: boolean }): void {
+		this.writeLine(serializeJsonLine({ type: "auth_response", requestId, ...response }));
+	}
+
+	/** Remove a stored credential on the agent host and refresh its models. */
+	async logout(provider: string): Promise<void> {
+		const response = await this.send({ type: "logout", provider });
+		if (!response.success) {
+			throw new Error(response.error);
+		}
+	}
+
+	/**
+	 * Upload a session file (JSONL content) into the agent's session directory
+	 * and switch to it. missingCwd signals the imported session's recorded cwd
+	 * no longer exists — prompt and retry with cwdOverride.
+	 */
+	async importSession(params: {
+		content: string;
+		fileName: string;
+		cwdOverride?: string;
+	}): Promise<{ cancelled: boolean; missingCwd?: { sessionFile?: string; sessionCwd: string; fallbackCwd: string } }> {
+		const response = await this.send({ type: "import_session", ...params });
+		if (!response.success) {
+			throw new Error(response.error);
+		}
+		return this.getData(response);
 	}
 
 	/** Provider ids currently authenticated via OAuth on the agent host. */

@@ -106,6 +106,12 @@ export type RpcCommand =
 	| { id?: string; type: "clear_queue" }
 	| { id?: string; type: "get_auth_status" }
 	| { id?: string; type: "refresh_models" }
+	| { id?: string; type: "login"; provider: string; method: "api_key" | "oauth" }
+	| { id?: string; type: "logout"; provider: string }
+	/** Response to an auth_prompt event; `requestId` correlates with the login command id. */
+	| { id?: string; type: "auth_response"; requestId: string; value?: string; cancelled?: boolean }
+	/** Upload a session file (JSONL content) into the agent's session dir and switch to it. */
+	| { id?: string; type: "import_session"; content: string; fileName: string; cwdOverride?: string }
 	| { id?: string; type: "rename_session"; sessionPath: string; name: string }
 
 	// Filesystem (executed against the agent-side filesystem)
@@ -119,7 +125,16 @@ export type RpcCommand =
 export const RPC_PROTOCOL_VERSION = 1;
 
 /** Optional capabilities advertised in `hello` (command types beyond the baseline). */
-export const RPC_CAPABILITIES = ["shutdown", "detach", "fs_complete", "read_file", "list_sessions"] as const;
+export const RPC_CAPABILITIES = [
+	"shutdown",
+	"detach",
+	"fs_complete",
+	"read_file",
+	"list_sessions",
+	"login",
+	"logout",
+	"import_session",
+] as const;
 export type RpcCapability = (typeof RPC_CAPABILITIES)[number];
 
 // ============================================================================
@@ -360,6 +375,19 @@ export type RpcResponse =
 			data: RpcAuthStatus;
 	  }
 	| { id?: string; type: "response"; command: "refresh_models"; success: true }
+	| { id?: string; type: "response"; command: "login"; success: true }
+	| { id?: string; type: "response"; command: "logout"; success: true }
+	| {
+			id?: string;
+			type: "response";
+			command: "import_session";
+			success: true;
+			data: {
+				cancelled: boolean;
+				/** Set when the imported session's recorded cwd does not exist; the client should prompt and retry with cwdOverride. */
+				missingCwd?: { sessionFile?: string; sessionCwd: string; fallbackCwd: string };
+			};
+	  }
 	| { id?: string; type: "response"; command: "rename_session"; success: true }
 
 	// Filesystem
@@ -423,6 +451,29 @@ export interface RpcSessionChangedEvent {
 	type: "session_changed";
 	sessionId: string;
 	cwd: string;
+}
+
+/**
+ * Emitted while a login command is in flight when the provider's auth flow
+ * needs user input. The client answers with an auth_response command whose
+ * requestId matches the login command's id.
+ */
+export interface RpcAuthPromptEvent {
+	type: "auth_prompt";
+	requestId: string;
+	prompt:
+		| { kind: "text"; message: string; placeholder?: string }
+		| { kind: "secret"; message: string; placeholder?: string }
+		| { kind: "manual_code"; message: string; placeholder?: string }
+		| { kind: "select"; message: string; options: Array<{ id: string; label: string; description?: string }> };
+}
+
+/** Fire-and-forget progress/info during a login flow (auth URLs, device codes, progress). */
+export interface RpcAuthNotifyEvent {
+	type: "auth_notify";
+	requestId: string;
+	/** AuthEvent from pi-ai (plain JSON: info/auth_url/device_code/progress). */
+	event: unknown;
 }
 
 /** Emitted when an extension event handler throws on the agent host. */

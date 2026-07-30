@@ -3,9 +3,9 @@
  * a real RpcClient, and RemoteAgentSession + RemoteAgentSessionRuntime on top.
  */
 
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +13,7 @@ import { AgentSession, type AgentSessionEvent } from "../src/core/agent-session.
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ExtensionFactory } from "../src/core/extensions/types.ts";
+import { MissingSessionCwdError } from "../src/core/session-cwd.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { RemoteAgentSession } from "../src/modes/attach/remote-agent-session.ts";
@@ -91,7 +92,7 @@ describe("RemoteAgentSession facade", () => {
 	});
 
 	async function startFixture(
-		options: { extensions?: ExtensionFactory[]; suffix?: string; streamDelayMs?: number } = {},
+		options: { extensions?: ExtensionFactory[]; suffix?: string; streamDelayMs?: number; persisted?: boolean } = {},
 	): Promise<Fixture> {
 		const tempDir = join(
 			tmpdir(),
@@ -127,7 +128,7 @@ describe("RemoteAgentSession facade", () => {
 
 		const session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(tempDir),
+			sessionManager: options.persisted ? SessionManager.create(tempDir) : SessionManager.inMemory(tempDir),
 			settingsManager,
 			cwd: tempDir,
 			modelRuntime: getModelRuntime(modelRegistry),
@@ -279,6 +280,104 @@ describe("RemoteAgentSession facade", () => {
 		expect(roots.length).toBeGreaterThan(0);
 		const count = (nodes: typeof roots): number => nodes.reduce((acc, node) => acc + 1 + count(node.children), 0);
 		expect(count(roots)).toBe(remote.sessionManager.getEntries().length);
+	});
+
+	it("logout and login round-trip over the wire", async () => {
+		const fixture = await startFixture();
+		const { remote } = await connectFacade(fixture);
+
+		expect(await remote.modelRuntime.listCredentials()).toContainEqual({
+			providerId: "anthropic",
+			type: "api_key",
+		});
+
+		await remote.modelRuntime.logout("anthropic");
+		expect(await remote.modelRuntime.listCredentials()).toHaveLength(0);
+
+		const prompts: Array<{ type: string; message: string }> = [];
+		await remote.modelRuntime.login("anthropic", "api_key", {
+			prompt: async (prompt: { type: string; message: string }) => {
+				prompts.push(prompt);
+				return "sk-ant-new-key";
+			},
+			notify: () => {},
+		});
+		expect(prompts.length).toBeGreaterThan(0);
+		expect(await remote.modelRuntime.listCredentials()).toContainEqual({
+			providerId: "anthropic",
+			type: "api_key",
+		});
+	});
+
+	it("imports a session file over the wire and rebinds", async () => {
+		const fixtureA = await startFixture({ suffix: "import-a", persisted: true });
+		const fixtureB = await startFixture({ suffix: "import-b", persisted: true });
+		await fixtureB.session.prompt("hello from b");
+		const sourceFile = fixtureB.session.sessionManager.getSessionFile();
+		if (!sourceFile) throw new Error("fixture session not persisted");
+		const sourceContent = readFileSync(sourceFile, "utf8");
+
+		// The fixture's stub host gets a real import: the uploaded file becomes
+		// the active session (content-identical to fixture B's session).
+		const host = fixtureA.runtimeHost as unknown as {
+			session: unknown;
+			importFromJsonl: ReturnType<typeof vi.fn>;
+		};
+		let importedPath: string | undefined;
+		host.importFromJsonl = vi.fn(async (path: string) => {
+			importedPath = path;
+			host.session = fixtureB.session;
+			return { cancelled: false };
+		});
+
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+		const rebinds: string[] = [];
+		runtime.setRebindSession(async (session) => {
+			rebinds.push(session.sessionId);
+		});
+
+		const uploadPath = join(fixtureA.tempDir, `imported-${Date.now()}.jsonl`);
+		writeFileSync(uploadPath, sourceContent, "utf8");
+
+		const result = await runtime.importFromJsonl(uploadPath);
+		expect(result.cancelled).toBe(false);
+
+		// Server wrote the upload into the AGENT's session dir (sanitized basename)
+		expect(importedPath).toBeDefined();
+		expect(basename(importedPath!)).toBe(basename(uploadPath));
+		expect(readFileSync(importedPath!, "utf8")).toBe(sourceContent);
+
+		await vi.waitFor(() => expect(rebinds).toContain(fixtureB.session.sessionId));
+		expect(remote.sessionId).toBe(fixtureB.session.sessionId);
+	});
+
+	it("maps missingCwd over the wire back to MissingSessionCwdError", async () => {
+		const fixtureA = await startFixture({ suffix: "import-cwd", persisted: true });
+		const host = fixtureA.runtimeHost as unknown as { importFromJsonl: ReturnType<typeof vi.fn> };
+		host.importFromJsonl = vi.fn(async () => {
+			throw new MissingSessionCwdError({ sessionCwd: "/gone/for/sure", fallbackCwd: fixtureA.tempDir });
+		});
+
+		const { client, remote, settingsManager } = await connectFacade(fixtureA);
+		const runtime = new RemoteAgentSessionRuntime({
+			client,
+			session: remote,
+			settingsManager,
+			agentDir: fixtureA.tempDir,
+		});
+
+		const uploadPath = join(fixtureA.tempDir, "imported-cwd.jsonl");
+		writeFileSync(uploadPath, "{}\n", "utf8");
+
+		const error = await runtime.importFromJsonl(uploadPath).catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(MissingSessionCwdError);
+		expect((error as MissingSessionCwdError).issue.sessionCwd).toBe("/gone/for/sure");
 	});
 
 	it("mirrors auth capabilities and credentials for /login and /logout", async () => {

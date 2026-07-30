@@ -9,12 +9,16 @@
  * contract of AgentSessionRuntime.
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { basename } from "node:path";
 import type { AgentSession } from "../../core/agent-session.ts";
-import { type AgentSessionRuntime, SessionImportUnsupportedError } from "../../core/agent-session-runtime.ts";
+import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionServices } from "../../core/agent-session-services.ts";
 import type { ModelRuntime } from "../../core/model-runtime.ts";
 import type { ResourceLoader } from "../../core/resource-loader.ts";
+import { MissingSessionCwdError } from "../../core/session-cwd.ts";
 import type { SettingsManager } from "../../core/settings-manager.ts";
+import { resolvePath } from "../../utils/paths.ts";
 import type { RpcClient } from "../rpc/rpc-client.ts";
 import type { RemoteAgentSession } from "./remote-agent-session.ts";
 
@@ -108,10 +112,29 @@ export class RemoteAgentSessionRuntime {
 		return { cancelled: result.cancelled, selectedText: result.text };
 	}
 
-	async importFromJsonl(): Promise<never> {
-		throw new SessionImportUnsupportedError(
-			"Session import is not supported in attach mode — import on the agent host",
-		);
+	/**
+	 * /import over the wire: the file is read on the CLIENT host (it lives in
+	 * the user's filesystem), its JSONL content is uploaded into the agent's
+	 * session directory, and the agent switches to it — the resulting
+	 * session_changed rebind lands the TUI on the imported session.
+	 */
+	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		const resolvedPath = resolvePath(inputPath, this.remoteSession.sessionManager.getCwd());
+		if (!existsSync(resolvedPath)) {
+			throw new SessionImportFileNotFoundError(resolvedPath);
+		}
+		const content = readFileSync(resolvedPath, "utf8");
+		const result = await this.client.importSession({
+			content,
+			fileName: basename(resolvedPath),
+			cwdOverride,
+		});
+		if (result.missingCwd) {
+			// Reconstruct the typed error so the TUI's stock retry flow
+			// (prompt for a cwd, retry with cwdOverride) works unchanged.
+			throw new MissingSessionCwdError(result.missingCwd);
+		}
+		return { cancelled: result.cancelled };
 	}
 
 	async dispose(): Promise<void> {

@@ -50,14 +50,22 @@ Semantics:
   wire (`list_sessions`, `rename_session`); full-text search is limited
   to session names/first messages.
 
+- `/login` and `/logout` work over the wire: the auth flow runs on the
+  agent host while its prompts/notifications are served by the attach
+  client's TUI dialogs (`login`, `logout`, `auth_response` commands and
+  `auth_prompt`/`auth_notify` events). OAuth flows that require a
+  localhost callback *on the agent host* (rather than a public redirect or
+  device code) cannot complete remotely.
+- `/import` works over the wire: the client reads the session file locally
+  and uploads its content (`import_session`); the agent writes it into its
+  session directory and switches to it.
+
 Known v1 degradations while attached:
 
-- `/login`, `/logout`, and credential management are not remotable —
-  authenticate on the agent host. OAuth status is mirrored for display.
 - Extension custom renderers fall back to default rendering; extension
   *dialogs* (select/confirm/input/editor) render with stock TUI components.
-- `/import` and `exportToJsonl`'s sync form are unavailable (the TUI's
-  `/export` uses the async form and works).
+- `exportToJsonl`'s sync form is unavailable (the TUI's `/export` uses the
+  async form and works).
 - `@`-file completion browses the *client* filesystem (content expansion
   happens agent-side only for agent-local paths).
 

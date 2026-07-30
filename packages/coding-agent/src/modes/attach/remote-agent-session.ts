@@ -118,6 +118,18 @@ export class RemoteAgentSession {
 		return session;
 	}
 
+	/** Refresh auth + model mirrors after a login/logout changed them agent-side. */
+	private async refreshAuthMirror(): Promise<void> {
+		const [auth, models] = await Promise.all([
+			this.client.getAuthStatus(),
+			this.client.getAvailableModels().catch(() => this._availableModels),
+		]);
+		this._oauthProviders = new Set(auth.oauthProviders);
+		this._authProviders = auth.providers ?? [];
+		this._credentials = auth.credentials ?? [];
+		this._availableModels = models;
+	}
+
 	/** Full mirror refetch. Called at attach and on session_changed. */
 	async refetchAll(): Promise<void> {
 		this._refetching++;
@@ -194,6 +206,20 @@ export class RemoteAgentSession {
 
 	/** >0 while a refetch is in flight; events queue instead of applying. */
 	private _refetching = 0;
+	/** Client-side auth callbacks for in-flight login flows, keyed by request id. */
+	private _authInteractions = new Map<
+		string,
+		{
+			prompt: (prompt: {
+				type: "text" | "secret" | "select" | "manual_code";
+				message: string;
+				placeholder?: string;
+				options?: readonly { id: string; label: string; description?: string }[];
+			}) => Promise<string>;
+			notify: (event: never) => void;
+		}
+	>();
+	private _authRequestCounter = 0;
 	private _pendingEvents: RpcServerEvent[] = [];
 
 	private routeEvent(event: RpcServerEvent): void {
@@ -204,6 +230,31 @@ export class RemoteAgentSession {
 			return;
 		}
 		switch (event.type) {
+			case "auth_prompt": {
+				const authEvent = event as {
+					requestId: string;
+					prompt: {
+						kind: "text" | "secret" | "select" | "manual_code";
+						message: string;
+						placeholder?: string;
+						options?: Array<{ id: string; label: string; description?: string }>;
+					};
+				};
+				const interaction = this._authInteractions.get(authEvent.requestId);
+				if (!interaction) return;
+				const { kind, ...rest } = authEvent.prompt;
+				interaction
+					.prompt({ type: kind, ...rest })
+					.then((value) => this.client.respondAuthPrompt(authEvent.requestId, { value }))
+					.catch(() => this.client.respondAuthPrompt(authEvent.requestId, { cancelled: true }));
+				return;
+			}
+			case "auth_notify": {
+				const authEvent = event as { requestId: string; event: unknown };
+				const interaction = this._authInteractions.get(authEvent.requestId);
+				interaction?.notify(authEvent.event as Parameters<typeof interaction.notify>[0]);
+				return;
+			}
 			case "extension_ui_request":
 				void this.handleUIRequest(event as RpcExtensionUIRequest);
 				return;
@@ -838,11 +889,35 @@ export class RemoteAgentSession {
 			this._oauthProviders.has(provider) ? { provider, oauth: true } : undefined,
 		checkAuth: async (provider?: string): Promise<boolean> =>
 			provider ? this._oauthProviders.has(provider) : this._oauthProviders.size > 0,
-		login: async (): Promise<never> => {
-			throw new Error("OAuth login is not available over attach — authenticate on the agent host");
+		// Bridged over the wire: the provider's auth flow runs on the agent
+		// host; its prompt/notify callbacks arrive as auth_prompt/auth_notify
+		// events and are served by the TUI's own dialogs via the interaction
+		// object the TUI passes in here.
+		login: async (
+			provider: string,
+			method: "api_key" | "oauth",
+			interaction: {
+				prompt: (prompt: {
+					type: "text" | "secret" | "select" | "manual_code";
+					message: string;
+					placeholder?: string;
+					options?: readonly { id: string; label: string; description?: string }[];
+				}) => Promise<string>;
+				notify: (event: never) => void;
+			},
+		): Promise<void> => {
+			const requestId = `login_${++this._authRequestCounter}`;
+			this._authInteractions.set(requestId, interaction);
+			try {
+				await this.client.loginWithId(requestId, provider, method);
+				await this.refreshAuthMirror();
+			} finally {
+				this._authInteractions.delete(requestId);
+			}
 		},
-		logout: async (): Promise<never> => {
-			throw new Error("OAuth logout is not available over attach — manage credentials on the agent host");
+		logout: async (provider: string): Promise<void> => {
+			await this.client.logout(provider);
+			await this.refreshAuthMirror();
 		},
 		// Rendering member: the logout selector lists the agent's stored
 		// credentials (mirrored via get_auth_status). The logout action itself

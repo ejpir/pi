@@ -18,6 +18,8 @@
  */
 
 import * as crypto from "node:crypto";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { VERSION } from "../../config.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
@@ -26,6 +28,7 @@ import type {
 	ExtensionWidgetOptions,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
+import { MissingSessionCwdError } from "../../core/session-cwd.ts";
 import { type SessionInfo, SessionManager } from "../../core/session-manager.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { completePaths, readSessionFile } from "./fs-commands.ts";
@@ -89,6 +92,8 @@ export class RpcServer {
 	private connection: RpcConnection | null = null;
 	private explicitlyDetached = false;
 	private pendingExtensionRequests = new Map<string, PendingExtensionRequest>();
+	/** In-flight login prompt waiters, keyed by the login command's id. */
+	private pendingAuthPrompts = new Map<string, { resolve: (value: string) => void; reject: (error: Error) => void }>();
 	private unsubscribe: (() => void) | undefined;
 	/** Agent-level event listeners (e.g. stdio backpressure) that must survive session rebinds. */
 	private agentEventListeners = new Set<() => void | Promise<void>>();
@@ -159,6 +164,13 @@ export class RpcServer {
 	private onConnectionClosed(connection: RpcConnection): void {
 		if (connection !== this.connection) return;
 		this.connection = null;
+
+		// A client mid-login is gone: reject its pending prompts so the flow
+		// unwinds instead of hanging the auth interaction forever.
+		for (const pending of this.pendingAuthPrompts.values()) {
+			pending.reject(new Error("Client disconnected during authentication"));
+		}
+		this.pendingAuthPrompts.clear();
 
 		if (this.options.connectionLoss === "shutdown") {
 			void this.initiateShutdown(0);
@@ -1013,6 +1025,86 @@ export class RpcServer {
 			case "refresh_models": {
 				await session.modelRuntime.refresh();
 				return this.success(id, "refresh_models");
+			}
+
+			case "login": {
+				const requestId = id ?? crypto.randomUUID();
+				const interaction = {
+					prompt: (prompt: {
+						type: "text" | "secret" | "select" | "manual_code";
+						message: string;
+						placeholder?: string;
+						options?: readonly { id: string; label: string; description?: string }[];
+					}): Promise<string> =>
+						new Promise<string>((resolve, reject) => {
+							this.pendingAuthPrompts.set(requestId, { resolve, reject });
+							const { type: promptType, ...rest } = prompt;
+							this.output({
+								type: "auth_prompt",
+								requestId,
+								prompt: { kind: promptType, ...rest },
+							});
+						}),
+					notify: (event: unknown) => {
+						this.output({ type: "auth_notify", requestId, event });
+					},
+				};
+				try {
+					await session.modelRuntime.login(command.provider, command.method, interaction);
+					return this.success(id, "login");
+				} finally {
+					this.pendingAuthPrompts.delete(requestId);
+				}
+			}
+
+			case "auth_response": {
+				const pending = this.pendingAuthPrompts.get(command.requestId);
+				if (pending) {
+					this.pendingAuthPrompts.delete(command.requestId);
+					if (command.cancelled) {
+						pending.reject(new Error("Authentication cancelled"));
+					} else {
+						pending.resolve(command.value ?? "");
+					}
+				}
+				return undefined;
+			}
+
+			case "logout": {
+				await session.modelRuntime.logout(command.provider);
+				return this.success(id, "logout");
+			}
+
+			case "import_session": {
+				// Sanitize: the uploaded file lands in the agent's session
+				// directory under its basename only — no path traversal.
+				const fileName = basename(command.fileName);
+				if (!fileName || fileName !== command.fileName || fileName === "." || fileName === "..") {
+					return this.error(id, command.type, `Invalid session file name: ${command.fileName}`);
+				}
+				const sessionDir = session.sessionManager.getSessionDir();
+				if (!existsSync(sessionDir)) {
+					mkdirSync(sessionDir, { recursive: true });
+				}
+				const destinationPath = join(sessionDir, fileName);
+				writeFileSync(destinationPath, command.content, "utf8");
+				try {
+					const result = await this.runtimeHost.importFromJsonl(destinationPath, command.cwdOverride);
+					if (!result.cancelled) {
+						await this.rebindSession();
+					}
+					return this.success(id, "import_session", result);
+				} catch (importError: unknown) {
+					if (importError instanceof MissingSessionCwdError) {
+						// Not an error for the wire: the client prompts for a cwd and
+						// retries with cwdOverride (stock /import flow).
+						return this.success(id, "import_session", {
+							cancelled: false,
+							missingCwd: importError.issue,
+						});
+					}
+					throw importError;
+				}
 			}
 
 			case "rename_session": {
