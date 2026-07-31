@@ -740,6 +740,33 @@ describe("RemoteAgentSession facade", () => {
 		spy.mockRestore();
 	});
 
+	it("defers opener replays fired before the first subscriber (attach-mode ordering)", async () => {
+		// RemoteAgentSession.connect() refetches BEFORE InteractiveMode
+		// subscribes: a mid-turn attach's opener replay must survive having
+		// zero listeners at emission time, or the working spinner never shows.
+		const fixture = await startFixture({ suffix: "deferred-openers", persisted: true });
+		const { client, remote } = await connectFacade(fixture);
+
+		// No subscribe() yet — mirrors connect() completing before the TUI
+		// attaches its listener.
+		const realState = await client.getState();
+		const spy = vi
+			.spyOn(client, "getState")
+			.mockResolvedValue({ ...realState, isStreaming: true, isCompacting: true });
+		await remote.refetchAll();
+
+		const seen: string[] = [];
+		remote.subscribe((event) => seen.push(event.type));
+		expect(seen).toContain("agent_start");
+		expect(seen).toContain("compaction_start");
+
+		// The flush is one-shot: a second subscriber must not see stale openers.
+		const second: string[] = [];
+		remote.subscribe((event) => second.push(event.type));
+		expect(second).toHaveLength(0);
+		spy.mockRestore();
+	});
+
 	it("synthesizes a missed assistant message_start from the first streamed update", async () => {
 		// The TUI's message_update handler no-ops without a streaming
 		// component; a mid-turn attach therefore needs the opener replayed

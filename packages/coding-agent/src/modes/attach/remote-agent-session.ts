@@ -313,10 +313,10 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 		// activity STARTED while we were blind (wasX === false): if we saw
 		// the opener live, the TUI still has its indicator from before.
 		if (state.isStreaming && !wasStreaming) {
-			this.emit({ type: "agent_start" } as AgentSessionEvent);
+			this.emitOpener({ type: "agent_start" } as AgentSessionEvent);
 		}
 		if (state.isCompacting && !wasCompacting) {
-			this.emit({ type: "compaction_start" } as AgentSessionEvent);
+			this.emitOpener({ type: "compaction_start" } as AgentSessionEvent);
 		}
 	}
 
@@ -350,6 +350,8 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 	 * for mid-turn attaches in routeEvent.
 	 */
 	private _assistantStreamOpen = false;
+	/** One-shot opener replays awaiting the first subscriber (see emitOpener). */
+	private _deferredOpeners: AgentSessionEvent[] = [];
 
 	private routeEvent(event: RpcServerEvent): void {
 		if (this._refetching > 0) {
@@ -422,7 +424,7 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 				this._assistantStreamOpen = true;
 				const start = { type: "message_start", message } as AgentSessionEvent;
 				this.applyMirror(start);
-				this.emit(start);
+				this.emitOpener(start);
 			}
 		}
 		this.applyMirror(event as AgentSessionEvent);
@@ -541,6 +543,20 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 		});
 	}
 
+	/**
+	 * Emit a one-shot opener replay (mid-turn attach synthesis). Unlike live
+	 * events these must not be lost when they fire before the first listener
+	 * subscribes — connect()'s initial refetch runs before InteractiveMode
+	 * subscribes — so they defer until the first subscriber arrives.
+	 */
+	private emitOpener(event: AgentSessionEvent): void {
+		if (this.listeners.size === 0) {
+			this._deferredOpeners.push(event);
+			return;
+		}
+		this.emit(event);
+	}
+
 	private emit(event: AgentSessionEvent): void {
 		for (const listener of [...this.listeners]) {
 			try {
@@ -619,6 +635,13 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 
 	subscribe(listener: (event: AgentSessionEvent) => void): () => void {
 		this.listeners.add(listener);
+		if (this._deferredOpeners.length > 0) {
+			// Flush one-shot opener replays that fired before any listener
+			// existed (InteractiveMode subscribes after connect()'s refetch).
+			const deferred = this._deferredOpeners;
+			this._deferredOpeners = [];
+			for (const event of deferred) this.emit(event);
+		}
 		return () => this.listeners.delete(listener);
 	}
 
