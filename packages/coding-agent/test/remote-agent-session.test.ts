@@ -767,6 +767,46 @@ describe("RemoteAgentSession facade", () => {
 		spy.mockRestore();
 	});
 
+	it("cancels deferred openers whose closer arrives before the first subscriber", async () => {
+		// The turn can END in the window between connect()'s refetch and the
+		// TUI's subscribe. Flushing the deferred agent_start then would turn
+		// on a spinner nothing ever turns off — the closer must cancel it.
+		const fixture = await startFixture({ suffix: "stale-openers", persisted: true });
+		const { client, remote } = await connectFacade(fixture);
+
+		const realState = await client.getState();
+		const spy = vi
+			.spyOn(client, "getState")
+			.mockResolvedValue({ ...realState, isStreaming: true, isCompacting: true });
+		await remote.refetchAll();
+		spy.mockRestore();
+
+		// Closers arrive while still nobody is subscribed.
+		const internals = remote as unknown as { routeEvent: (event: unknown) => void };
+		internals.routeEvent({ type: "agent_end", messages: [] });
+		internals.routeEvent({ type: "compaction_end" });
+
+		const seen: string[] = [];
+		remote.subscribe((event) => seen.push(event.type));
+		expect(seen).toHaveLength(0);
+	});
+
+	it("defers live openers in the pre-subscribe window (turn starting during attach)", async () => {
+		// A turn STARTING between connect() and subscribe must reach the
+		// first subscriber like a synthesized replay would — otherwise the
+		// original silent-UI bug returns through the live path.
+		const fixture = await startFixture({ suffix: "live-openers", persisted: true });
+		const { remote } = await connectFacade(fixture);
+
+		const internals = remote as unknown as { routeEvent: (event: unknown) => void };
+		internals.routeEvent({ type: "agent_start" });
+
+		const seen: string[] = [];
+		remote.subscribe((event) => seen.push(event.type));
+		expect(seen).toEqual(["agent_start"]);
+		expect(remote.isStreaming).toBe(true);
+	});
+
 	it("synthesizes a missed assistant message_start from the first streamed update", async () => {
 		// The TUI's message_update handler no-ops without a streaming
 		// component; a mid-turn attach therefore needs the opener replayed

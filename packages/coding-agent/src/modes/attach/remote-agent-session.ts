@@ -428,7 +428,19 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 			}
 		}
 		this.applyMirror(event as AgentSessionEvent);
-		this.emit(event as AgentSessionEvent);
+		// Live opener-class events must survive the pre-subscribe window too
+		// (a turn STARTING between connect() and the TUI's subscribe would
+		// otherwise vanish exactly like the synthesized replays).
+		const type = (event as AgentSessionEvent).type;
+		const isOpener =
+			type === "agent_start" ||
+			type === "compaction_start" ||
+			(type === "message_start" && (event as { message?: { role?: string } }).message?.role === "assistant");
+		if (isOpener) {
+			this.emitOpener(event as AgentSessionEvent);
+		} else {
+			this.emit(event as AgentSessionEvent);
+		}
 	}
 
 	private applyMirror(event: AgentSessionEvent): void {
@@ -440,6 +452,7 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 			case "agent_end":
 				this.mirror.isStreaming = false;
 				this._assistantStreamOpen = false;
+				this.cancelDeferredOpeners("agent_start", "message_start");
 				void this.client
 					.getContextUsage()
 					.then((usage) => {
@@ -458,6 +471,7 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 			case "message_end":
 				if ((e.message as { role?: string } | undefined)?.role === "assistant") {
 					this._assistantStreamOpen = false;
+					this.cancelDeferredOpeners("message_start");
 				}
 				if (e.message) {
 					// Replay hazard, drain-only: messages that completed while a
@@ -489,6 +503,7 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 				break;
 			case "compaction_end":
 				this.mirror.isCompacting = false;
+				this.cancelDeferredOpeners("compaction_start");
 				break;
 			case "auto_retry_start":
 				this.mirror.retryAttempt = e.attempt as number;
@@ -544,10 +559,14 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 	}
 
 	/**
-	 * Emit a one-shot opener replay (mid-turn attach synthesis). Unlike live
+	 * Emit an opener-class event (agent_start / compaction_start / assistant
+	 * message_start — synthesized replays and live ones alike). Unlike other
 	 * events these must not be lost when they fire before the first listener
 	 * subscribes — connect()'s initial refetch runs before InteractiveMode
-	 * subscribes — so they defer until the first subscriber arrives.
+	 * subscribes — so they defer until the first subscriber arrives. A closer
+	 * passing through applyMirror meanwhile cancels its matching deferred
+	 * opener, so the flush can never turn on an indicator whose activity
+	 * already ended.
 	 */
 	private emitOpener(event: AgentSessionEvent): void {
 		if (this.listeners.size === 0) {
@@ -555,6 +574,12 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 			return;
 		}
 		this.emit(event);
+	}
+
+	/** Drop deferred openers a later closer has made stale (see emitOpener). */
+	private cancelDeferredOpeners(...types: string[]): void {
+		if (this._deferredOpeners.length === 0) return;
+		this._deferredOpeners = this._deferredOpeners.filter((opener) => !types.includes(opener.type));
 	}
 
 	private emit(event: AgentSessionEvent): void {
