@@ -761,11 +761,18 @@ export class RpcClient {
 		await this.sendChecked({ type: "set_session_name", name });
 	}
 
+	async getMessages(): Promise<AgentMessage[]> {
+		const response = await this.send({ type: "get_messages" });
+		return this.getData<{ messages: AgentMessage[] }>(response).messages;
+	}
+
 	/**
-	 * Get all messages in the session plus the message_end sequence
-	 * high-water mark (0 for older servers that don't stamp sequences).
+	 * Get all messages plus the server's per-session message_end sequence
+	 * high-water mark (0 for servers that predate seq stamps). Only the
+	 * attach facade needs the mark (drain-window dedup); getMessages()
+	 * keeps upstream's exact contract.
 	 */
-	async getMessages(): Promise<{ messages: AgentMessage[]; messageSeq: number }> {
+	async getMessagesWithSeq(): Promise<{ messages: AgentMessage[]; messageSeq: number }> {
 		const response = await this.send({ type: "get_messages" });
 		const data = this.getData<{ messages: AgentMessage[]; messageSeq?: number }>(response);
 		return { messages: data.messages, messageSeq: data.messageSeq ?? 0 };

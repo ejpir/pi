@@ -252,7 +252,7 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 			await Promise.all([
 				this.client.getState(),
 				this.client.getEntries(),
-				this.client.getMessages(),
+				this.client.getMessagesWithSeq(),
 				this.client.getSystemPrompt(),
 				this.client.getContextUsage(),
 				this.client.getTools(),

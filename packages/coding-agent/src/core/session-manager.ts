@@ -1044,8 +1044,9 @@ export class SessionManager {
 	/**
 	 * Optional listener invoked synchronously after every entry is appended
 	 * (messages, compaction/branch summaries, labels, model/thinking changes,
-	 * session info, custom entries). AgentSession wires this to emit the
-	 * public entry_appended event.
+	 * session info, custom entries). RpcServer chains this to stream every
+	 * entry to clients; AgentSession's own entry_appended event keeps its
+	 * upstream semantics (custom entries only).
 	 */
 	onEntryAppended: ((entry: SessionEntry) => void) | undefined;
 

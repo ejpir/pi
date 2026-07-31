@@ -375,14 +375,6 @@ export class AgentSession {
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
-		// Emit entry_appended for every append (the event previously only
-		// fired for extension custom entries). InteractiveMode's handler only
-		// renders custom entries; RPC mirrors rely on the complete stream.
-		const previousOnEntryAppended = this.sessionManager.onEntryAppended;
-		this.sessionManager.onEntryAppended = (entry) => {
-			previousOnEntryAppended?.(entry);
-			this._emit({ type: "entry_appended", entry });
-		};
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
@@ -2383,9 +2375,11 @@ export class AgentSession {
 					});
 				},
 				appendEntry: (customType, data) => {
-					// entry_appended is emitted via the session manager's
-					// onEntryAppended hook.
-					this.sessionManager.appendCustomEntry(customType, data);
+					const entryId = this.sessionManager.appendCustomEntry(customType, data);
+					const entry = this.sessionManager.getEntry(entryId);
+					if (entry) {
+						this._emit({ type: "entry_appended", entry });
+					}
 				},
 				setSessionName: (name) => {
 					this.setSessionName(name);

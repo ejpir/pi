@@ -30,7 +30,7 @@ import type {
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
 import { MissingSessionCwdError } from "../../core/session-cwd.ts";
-import { type SessionInfo, SessionManager } from "../../core/session-manager.ts";
+import { type SessionEntry, type SessionInfo, SessionManager } from "../../core/session-manager.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { completePaths, readSessionFile } from "./fs-commands.ts";
 import {
@@ -105,6 +105,7 @@ export class RpcServer {
 	/** In-flight login prompt waiters, keyed by the login command's id. */
 	private pendingAuthPrompts = new Map<string, { resolve: (value: string) => void; reject: (error: Error) => void }>();
 	private unsubscribe: (() => void) | undefined;
+	private restoreEntryAppendedHook: (() => void) | undefined;
 	/** Agent-level event listeners (e.g. stdio backpressure) that must survive session rebinds. */
 	private agentEventListeners = new Set<() => void | Promise<void>>();
 	private agentEventUnsubscribe: (() => void) | undefined;
@@ -479,8 +480,33 @@ export class RpcServer {
 			},
 		});
 
+		// Wire-level entry stream: forward EVERY append exactly once. Core's
+		// entry_appended semantics stay upstream (custom entries only); this
+		// is the RPC layer's own tap on the session manager, chained onto
+		// any previous consumer and restored on rebind/dispose.
+		this.restoreEntryAppendedHook?.();
+		const entrySessionManager = session.sessionManager;
+		const previousOnEntryAppended = entrySessionManager.onEntryAppended;
+		const entryAppendedHook = (entry: SessionEntry): void => {
+			previousOnEntryAppended?.(entry);
+			this.output({ type: "entry_appended", entry });
+		};
+		entrySessionManager.onEntryAppended = entryAppendedHook;
+		this.restoreEntryAppendedHook = () => {
+			// Restore only if our hook is still the installed one — if a later
+			// chainer owns the slot, a blind restore would silently drop it.
+			if (entrySessionManager.onEntryAppended === entryAppendedHook) {
+				entrySessionManager.onEntryAppended = previousOnEntryAppended;
+			}
+		};
+
 		this.unsubscribe?.();
 		this.unsubscribe = session.subscribe((event) => {
+			// The wire entry stream comes from the session-manager hook above
+			// (every entry, exactly once). The session subscription's
+			// entry_appended covers custom entries only — forwarding it here
+			// would double those on the wire.
+			if (event.type === "entry_appended") return;
 			// The message is already in session.messages when this fires, so
 			// seq <= high-water always means "included in the snapshot". The
 			// converse is weaker: get_messages can observe a message during
@@ -1352,8 +1378,10 @@ export class RpcServer {
 
 		this.unsubscribe?.();
 		this.agentEventUnsubscribe?.();
+		this.restoreEntryAppendedHook?.();
 		this.unsubscribe = undefined;
 		this.agentEventUnsubscribe = undefined;
+		this.restoreEntryAppendedHook = undefined;
 		this.agentEventListeners.clear();
 
 		// Nothing can answer outstanding extension dialogs anymore — settle them

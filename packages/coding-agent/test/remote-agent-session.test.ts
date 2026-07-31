@@ -707,9 +707,30 @@ describe("RemoteAgentSession facade", () => {
 
 		// The snapshot's high-water mark covers exactly the stamped events so
 		// far: a client draining queued events can drop seq <= high-water.
-		const snapshot = await client.getMessages();
+		const snapshot = await client.getMessagesWithSeq();
 		expect(snapshot.messageSeq).toBe(seqs[seqs.length - 1]);
 		expect(snapshot.messages.length).toBeGreaterThan(0);
+	});
+
+	it("streams every entry exactly once (server taps the manager hook, not the session event)", async () => {
+		// Regression guard: the wire entry stream comes from RpcServer's
+		// session-manager hook (all entries); the session subscription's
+		// entry_appended (custom entries only, upstream semantics) must NOT
+		// also be forwarded or those entries would arrive twice.
+		const fixture = await startFixture({ suffix: "entry-once", persisted: true });
+		const { client, remote } = await connectFacade(fixture);
+
+		const seen: string[] = [];
+		client.onEvent((event) => {
+			const e = event as { type?: string; entry?: { id?: string } };
+			if (e.type === "entry_appended" && e.entry?.id) seen.push(e.entry.id);
+		});
+
+		await remote.prompt("stream some entries");
+		await remote.waitForIdle();
+
+		expect(seen.length).toBeGreaterThan(0);
+		expect(new Set(seen).size).toBe(seen.length);
 	});
 
 	it("dedups drain replays by sequence identity against the snapshot high-water mark", async () => {
