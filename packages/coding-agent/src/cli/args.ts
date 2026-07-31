@@ -333,6 +333,9 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} list                      List installed extensions from settings
   ${APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
   ${APP_NAME} auth <command>            Print credentials for external clients
+  ${APP_NAME} attach (--cmd <command> | --sock <path>)
+                                 Attach the interactive TUI to an agent served
+                                 over RPC (--mode rpc [--sock <path>])
   ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth
 
 ${chalk.bold("Options:")}

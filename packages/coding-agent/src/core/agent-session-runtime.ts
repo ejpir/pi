@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
@@ -387,14 +387,29 @@ export class AgentSessionRuntime {
 		}
 
 		// Fail fast with a clear message for the common trap: /import reads
-		// JSONL session files; an HTML export is not importable.
+		// JSONL session files; an HTML export is not importable. Sniff only
+		// the first bytes — session files can be hundreds of MB, so a full
+		// readFileSync here would double the import's peak memory for a
+		// one-character check.
+		const SNIFF_BYTES = 4096;
 		let trimmed: string;
+		let fileSize: number;
 		try {
-			trimmed = readFileSync(resolvedPath, "utf8").trimStart();
+			const fd = openSync(resolvedPath, "r");
+			try {
+				fileSize = fstatSync(fd).size;
+				const buf = Buffer.alloc(SNIFF_BYTES);
+				const n = readSync(fd, buf, 0, SNIFF_BYTES, 0);
+				trimmed = buf.subarray(0, n).toString("utf8").trimStart();
+			} finally {
+				closeSync(fd);
+			}
 		} catch (error) {
 			throw new SessionImportError(error instanceof Error ? error.message : String(error));
 		}
-		if (trimmed.length === 0) {
+		// "Empty" only when the whole file fit in the sniff window; a file
+		// with >4KB of leading whitespace falls through to the JSONL check.
+		if (trimmed.length === 0 && fileSize <= SNIFF_BYTES) {
 			throw new SessionImportError("Session file is empty");
 		}
 		if (!trimmed.startsWith("{")) {
