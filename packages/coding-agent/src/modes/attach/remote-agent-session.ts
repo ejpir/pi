@@ -248,6 +248,10 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 	}
 
 	private async refetchAllInner(): Promise<void> {
+		// Captured before the mirror overwrite so a mid-turn (re)attach can be
+		// told apart from a state refresh during a turn this client started.
+		const wasStreaming = this.mirror.isStreaming;
+		const wasCompacting = this.mirror.isCompacting;
 		const [state, entries, messages, systemPrompt, usage, tools, levels, models, auth, resources, commands] =
 			await Promise.all([
 				this.client.getState(),
@@ -301,6 +305,19 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 		this._credentials = auth.credentials ?? [];
 		this._commands = commands;
 		this._resources = resources;
+
+		// Mid-turn (re)attach: the turn/compaction openers fired before this
+		// client attached, and the TUI's working/compaction indicators are
+		// event-driven — without replaying the openers, a reattached client
+		// shows a silent UI until the turn ends. Only synthesize when the
+		// activity STARTED while we were blind (wasX === false): if we saw
+		// the opener live, the TUI still has its indicator from before.
+		if (state.isStreaming && !wasStreaming) {
+			this.emit({ type: "agent_start" } as AgentSessionEvent);
+		}
+		if (state.isCompacting && !wasCompacting) {
+			this.emit({ type: "compaction_start" } as AgentSessionEvent);
+		}
 	}
 
 	// =========================================================================
@@ -327,6 +344,12 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 	private _drainingPending = false;
 	/** message_end sequence high-water of the last snapshot (0 = legacy server). */
 	private _snapshotSeq = 0;
+	/**
+	 * True while an assistant stream is open from THIS client's perspective
+	 * (message_start seen or synthesized). Drives the message_start replay
+	 * for mid-turn attaches in routeEvent.
+	 */
+	private _assistantStreamOpen = false;
 
 	private routeEvent(event: RpcServerEvent): void {
 		if (this._refetching > 0) {
@@ -389,6 +412,19 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 				break;
 			}
 		}
+		if (event.type === "message_update" && !this._assistantStreamOpen) {
+			const message = (event as { message?: AgentMessage }).message;
+			if (message?.role === "assistant") {
+				// Mid-turn (re)attach: message_start fired before this client
+				// attached, and the TUI's message_update handler no-ops without a
+				// streaming component. Replay the opener carrying the current
+				// partial content; live updates take over from here.
+				this._assistantStreamOpen = true;
+				const start = { type: "message_start", message } as AgentSessionEvent;
+				this.applyMirror(start);
+				this.emit(start);
+			}
+		}
 		this.applyMirror(event as AgentSessionEvent);
 		this.emit(event as AgentSessionEvent);
 	}
@@ -401,6 +437,7 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 				break;
 			case "agent_end":
 				this.mirror.isStreaming = false;
+				this._assistantStreamOpen = false;
 				void this.client
 					.getContextUsage()
 					.then((usage) => {
@@ -411,7 +448,15 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 			case "agent_settled":
 				for (const waiter of [...this.idleWaiters]) waiter();
 				break;
+			case "message_start":
+				if ((e.message as { role?: string } | undefined)?.role === "assistant") {
+					this._assistantStreamOpen = true;
+				}
+				break;
 			case "message_end":
+				if ((e.message as { role?: string } | undefined)?.role === "assistant") {
+					this._assistantStreamOpen = false;
+				}
 				if (e.message) {
 					// Replay hazard, drain-only: messages that completed while a
 					// refetch was in flight are already in the fresh snapshot,

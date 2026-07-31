@@ -712,6 +712,59 @@ describe("RemoteAgentSession facade", () => {
 		expect(snapshot.messages.length).toBeGreaterThan(0);
 	});
 
+	it("replays turn openers on mid-turn attach so the TUI shows it is working", async () => {
+		// Attaching while the agent is busy must not look idle: the working
+		// indicator (agent_start) and compaction indicator (compaction_start)
+		// are event-driven in the TUI, so the facade replays the openers when
+		// the refetched state says the activity started while we were blind.
+		const fixture = await startFixture({ suffix: "resume-openers", persisted: true });
+		const { client, remote } = await connectFacade(fixture);
+
+		const seen: string[] = [];
+		remote.subscribe((event) => seen.push(event.type));
+
+		const realState = await client.getState();
+		const spy = vi
+			.spyOn(client, "getState")
+			.mockResolvedValue({ ...realState, isStreaming: true, isCompacting: true });
+		await remote.refetchAll();
+		expect(seen).toContain("agent_start");
+		expect(seen).toContain("compaction_start");
+
+		// A second refetch during the SAME turn must not re-fire the openers
+		// (the TUI still has its indicators from the first replay).
+		seen.length = 0;
+		await remote.refetchAll();
+		expect(seen).not.toContain("agent_start");
+		expect(seen).not.toContain("compaction_start");
+		spy.mockRestore();
+	});
+
+	it("synthesizes a missed assistant message_start from the first streamed update", async () => {
+		// The TUI's message_update handler no-ops without a streaming
+		// component; a mid-turn attach therefore needs the opener replayed
+		// (with the update's partial content) exactly once per stream.
+		const fixture = await startFixture({ suffix: "resume-stream", persisted: true });
+		const { remote } = await connectFacade(fixture);
+
+		const seen: string[] = [];
+		remote.subscribe((event) => seen.push(event.type));
+		const internals = remote as unknown as { routeEvent: (event: unknown) => void };
+		const partial = { role: "assistant", content: [{ type: "text", text: "partial" }], timestamp: 1 };
+
+		internals.routeEvent({ type: "message_update", message: partial });
+		expect(seen).toEqual(["message_start", "message_update"]);
+
+		// Subsequent updates flow through without another synthesized opener.
+		internals.routeEvent({ type: "message_update", message: partial });
+		expect(seen).toEqual(["message_start", "message_update", "message_update"]);
+
+		// Stream close resets: the next turn's attach replays the opener again.
+		internals.routeEvent({ type: "message_end", message: partial });
+		internals.routeEvent({ type: "message_update", message: partial });
+		expect(seen.filter((t) => t === "message_start")).toHaveLength(2);
+	});
+
 	it("streams every entry exactly once (server taps the manager hook, not the session event)", async () => {
 		// Regression guard: the wire entry stream comes from RpcServer's
 		// session-manager hook (all entries); the session subscription's
