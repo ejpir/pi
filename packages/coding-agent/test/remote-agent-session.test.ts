@@ -1079,4 +1079,48 @@ describe("RemoteAgentSession facade", () => {
 
 		await vi.waitFor(() => expect(detached).toEqual(["takeover"]));
 	});
+
+	it("covers every projection member the TUI source touches (runtime-miss tripwire)", async () => {
+		// The facade's narrowed projections (extensionRunner, resourceLoader,
+		// modelRuntime, sessionManager) are outside the Pick-conformance
+		// check, so a TUI change that starts touching a new member crashes
+		// attach at runtime (see: getMarkdownTransformers after the markdown
+		// transform merge). This scans the interactive-mode sources for
+		// direct member chains and asserts each exists on a live facade.
+		// Locals holding a projection (e.g. this.modelRuntime in
+		// model-selector) are matched by their field name.
+		const interactiveDir = join(__dirname, "..", "src", "modes", "interactive");
+		const sources = readdirSync(interactiveDir, { recursive: true, withFileTypes: true })
+			.filter((entry) => entry.isFile() && entry.name.endsWith(".ts"))
+			.map((entry) => readFileSync(join(entry.parentPath, entry.name), "utf8"))
+			.join("\n");
+
+		const touched = new Map<string, Set<string>>();
+		const chainPattern =
+			/\b(?:session|services|this)\.(extensionRunner|resourceLoader|modelRuntime|sessionManager)\.([A-Za-z_$][\w$]*)/g;
+		for (const match of sources.matchAll(chainPattern)) {
+			const [, projection, member] = match;
+			if (!touched.has(projection)) touched.set(projection, new Set());
+			touched.get(projection)!.add(member);
+		}
+
+		// The scan must at least see the member that crashed attach once —
+		// if this fails, the regex rotted, not the facade.
+		expect(touched.get("extensionRunner")).toBeDefined();
+		expect([...touched.get("extensionRunner")!]).toContain("getMarkdownTransformers");
+
+		const fixture = await startFixture({ suffix: "coverage" });
+		const { remote } = await connectFacade(fixture);
+		const facade = remote as unknown as Record<string, Record<string, unknown>>;
+
+		const missing: string[] = [];
+		for (const [projection, members] of touched) {
+			for (const member of members) {
+				if (facade[projection]?.[member] === undefined) {
+					missing.push(`${projection}.${member}`);
+				}
+			}
+		}
+		expect(missing, `facade is missing members the TUI touches: ${missing.join(", ")}`).toEqual([]);
+	});
 });

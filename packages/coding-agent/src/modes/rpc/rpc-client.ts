@@ -207,10 +207,13 @@ export class RpcClient {
 		let childProcess: ChildProcess;
 
 		if (this.options.command) {
-			childProcess = spawn("sh", ["-c", this.options.command], {
+			// shell:true → /bin/sh -c on POSIX, %COMSPEC% on Windows, keeping
+			// the documented "Windows client, POSIX agent" path working.
+			childProcess = spawn(this.options.command, [], {
 				cwd: this.options.cwd,
 				env: { ...process.env, ...this.options.env },
 				stdio: ["pipe", "pipe", "pipe"],
+				shell: true,
 			});
 		} else {
 			const cliPath = this.options.cliPath ?? "dist/cli.js";
