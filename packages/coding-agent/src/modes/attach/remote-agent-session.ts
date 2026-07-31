@@ -1173,6 +1173,11 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 		emitUserBash: async (): Promise<undefined> => undefined,
 		getMessageRenderer: (): undefined => undefined,
 		getEntryRenderer: (): undefined => undefined,
+		// Markdown transformers are functions — they cannot cross the wire.
+		// Attach renders stock markdown; extension-provided transforms are a
+		// documented rendering-only degradation (proxying would be a round
+		// trip per render call).
+		getMarkdownTransformers: (): unknown[] => [],
 		getShortcuts: (): unknown[] => [],
 		getCommandDiagnostics: (): unknown[] => [],
 		getShortcutDiagnostics: (): unknown[] => [],
