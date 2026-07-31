@@ -29,6 +29,12 @@ describe("attach subcommand parsing", () => {
 		expect(args.diagnostics.some((d) => d.message.includes("Unknown argument"))).toBe(true);
 	});
 
+	it("reports a value flag missing its value (not as an unknown argument)", () => {
+		const args = parseArgs(["attach", "--cmd"]);
+		expect(args.diagnostics.some((d) => d.message.includes("--cmd requires a value"))).toBe(true);
+		expect(args.diagnostics.some((d) => d.message.includes("Unknown argument"))).toBe(false);
+	});
+
 	it("accepts --verbose", () => {
 		const args = parseArgs(["attach", "--sock", "/tmp/s", "--verbose"]);
 		expect(args.verbose).toBe(true);

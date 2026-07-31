@@ -65,6 +65,90 @@ export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 	return VALID_THINKING_LEVELS.includes(level as ThinkingLevel);
 }
 
+/**
+ * A CLI subcommand: a different program matched on argv[0], with a flag
+ * grammar disjoint from the agent flags of the main parse loop (git push
+ * vs git pull, not another --flag). Declarative so parseSubcommand can run
+ * the shared scan — adding the next subcommand is a table entry, not a
+ * third copy of the loop machinery.
+ */
+interface Subcommand {
+	/** argv[0] keyword, e.g. "attach". */
+	readonly name: string;
+	/** Mark the parse result for dispatch (e.g. set result.attach = {}). */
+	readonly init: (result: Args) => void;
+	/** Flags that consume the next argv element as their value. */
+	readonly valueFlags: ReadonlySet<string>;
+	/** Boolean flags that take no value. */
+	readonly boolFlags: ReadonlySet<string>;
+	/** Apply one parsed flag; value is set iff the flag is a value flag. */
+	readonly apply: (result: Args, flag: string, value?: string) => void;
+	/** Cross-flag invariants checked after the scan; push diagnostics. */
+	readonly validate?: (result: Args) => void;
+}
+
+const attachSubcommand: Subcommand = {
+	name: "attach",
+	init: (result) => {
+		result.attach = {};
+	},
+	valueFlags: new Set(["--cmd", "--sock"]),
+	boolFlags: new Set(["--help", "-h", "--verbose"]),
+	apply(result, flag, value) {
+		const attach = result.attach;
+		if (!attach) return;
+		switch (flag) {
+			case "--cmd":
+				attach.command = value;
+				break;
+			case "--sock":
+				attach.sock = value;
+				break;
+			case "--help":
+			case "-h":
+				result.help = true;
+				break;
+			case "--verbose":
+				result.verbose = true;
+				break;
+		}
+	},
+	validate(result) {
+		const attach = result.attach;
+		if (!attach) return;
+		if (!result.help && !attach.command && !attach.sock) {
+			result.diagnostics.push({ type: "error", message: "attach requires --cmd <command> or --sock <path>" });
+		}
+		if (attach.command && attach.sock) {
+			result.diagnostics.push({ type: "error", message: "attach: --cmd and --sock are mutually exclusive" });
+		}
+	},
+};
+
+/** Every subcommand parseArgs dispatches before the main flag loop. */
+const subcommands: readonly Subcommand[] = [attachSubcommand];
+
+/** Run a subcommand's declarative grammar over its argv (after the keyword). */
+function parseSubcommand(spec: Subcommand, argv: string[], result: Args): Args {
+	spec.init(result);
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (spec.valueFlags.has(arg)) {
+			if (i + 1 < argv.length) {
+				spec.apply(result, arg, argv[++i]);
+			} else {
+				result.diagnostics.push({ type: "error", message: `${spec.name}: ${arg} requires a value` });
+			}
+		} else if (spec.boolFlags.has(arg)) {
+			spec.apply(result, arg);
+		} else {
+			result.diagnostics.push({ type: "error", message: `Unknown argument for ${spec.name}: ${arg}` });
+		}
+	}
+	spec.validate?.(result);
+	return result;
+}
+
 export function parseArgs(args: string[]): Args {
 	const result: Args = {
 		messages: [],
@@ -73,32 +157,11 @@ export function parseArgs(args: string[]): Args {
 		diagnostics: [],
 	};
 
-	if (args[0] === "attach") {
-		result.attach = {};
-		for (let i = 1; i < args.length; i++) {
-			const arg = args[i];
-			if (arg === "--cmd" && i + 1 < args.length) {
-				result.attach.command = args[++i];
-			} else if (arg === "--sock" && i + 1 < args.length) {
-				result.attach.sock = args[++i];
-			} else if (arg === "--help" || arg === "-h") {
-				result.help = true;
-			} else if (arg === "--verbose") {
-				result.verbose = true;
-			} else {
-				result.diagnostics.push({
-					type: "error",
-					message: `Unknown argument for attach: ${arg}`,
-				});
-			}
-		}
-		if (!result.help && !result.attach.command && !result.attach.sock) {
-			result.diagnostics.push({ type: "error", message: "attach requires --cmd <command> or --sock <path>" });
-		}
-		if (result.attach.command && result.attach.sock) {
-			result.diagnostics.push({ type: "error", message: "attach: --cmd and --sock are mutually exclusive" });
-		}
-		return result;
+	// Subcommands match on argv[0] and own everything after it; their flag
+	// sets are disjoint from the agent flags parsed by the main loop below.
+	const subcommand = subcommands.find((spec) => spec.name === args[0]);
+	if (subcommand) {
+		return parseSubcommand(subcommand, args.slice(1), result);
 	}
 
 	for (let i = 0; i < args.length; i++) {
