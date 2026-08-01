@@ -3,6 +3,7 @@
 export { Marked, type Token, type Tokens } from "marked";
 // Autocomplete support
 export {
+	type AutocompleteFileSearcher,
 	type AutocompleteItem,
 	type AutocompleteProvider,
 	type AutocompleteSuggestions,

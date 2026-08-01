@@ -20,10 +20,13 @@ import type {
 	LoadExtensionsResult,
 } from "../src/core/extensions/index.ts";
 import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.ts";
+import type { PromptTemplate } from "../src/core/prompt-templates.ts";
 import type { ResourceLoader } from "../src/core/resource-loader.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import type { Skill } from "../src/core/skills.ts";
 import { createCodingTools } from "../src/index.ts";
+import type { Theme } from "../src/modes/interactive/theme/theme.ts";
 
 /**
  * API key for authenticated tests. Tests using this should be wrapped in
@@ -208,6 +211,9 @@ export async function createTestExtensionsResult(
 
 export interface CreateTestResourceLoaderOptions {
 	extensionsResult?: LoadExtensionsResult;
+	prompts?: PromptTemplate[];
+	skills?: Skill[];
+	themes?: Theme[];
 }
 
 export function createTestResourceLoader(options: CreateTestResourceLoaderOptions = {}): ResourceLoader {
@@ -219,9 +225,9 @@ export function createTestResourceLoader(options: CreateTestResourceLoaderOption
 
 	return {
 		getExtensions: () => extensionsResult,
-		getSkills: () => ({ skills: [], diagnostics: [] }),
-		getPrompts: () => ({ prompts: [], diagnostics: [] }),
-		getThemes: () => ({ themes: [], diagnostics: [] }),
+		getSkills: () => ({ skills: options.skills ?? [], diagnostics: [] }),
+		getPrompts: () => ({ prompts: options.prompts ?? [], diagnostics: [] }),
+		getThemes: () => ({ themes: options.themes ?? [], diagnostics: [] }),
 		getAgentsFiles: () => ({ agentsFiles: [] }),
 		getSystemPrompt: () => undefined,
 		getSystemPromptSource: () => undefined,

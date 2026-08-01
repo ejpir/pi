@@ -1041,11 +1041,26 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Optional listener invoked synchronously after every entry is appended
+	 * (messages, compaction/branch summaries, labels, model/thinking changes,
+	 * session info, custom entries). RpcServer chains this to stream every
+	 * entry to clients; AgentSession's own entry_appended event keeps its
+	 * upstream semantics (custom entries only).
+	 */
+	onEntryAppended: ((entry: SessionEntry) => void) | undefined;
+
 	private _appendEntry(entry: SessionEntry): void {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
+		try {
+			this.onEntryAppended?.(entry);
+		} catch {
+			// A listener must never break the append path (persistence already
+			// succeeded); swallow to keep SessionManager failures impossible.
+		}
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.

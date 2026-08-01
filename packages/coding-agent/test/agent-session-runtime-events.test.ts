@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
@@ -8,6 +8,7 @@ import {
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
+	SessionImportError,
 } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
@@ -253,5 +254,26 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const cancelAtResult = await runtimeHost.fork("missing-entry", { position: "at" });
 		expect(cancelAtResult).toEqual({ cancelled: true });
 		expect(events).toEqual([{ type: "session_before_fork", entryId: "missing-entry", position: "at" }]);
+	});
+
+	it("importFromJsonl reports bad files via SessionImportError (non-fatal class)", async () => {
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		const sessionDir = runtimeHost.session.sessionManager.getSessionDir();
+		mkdirSync(sessionDir, { recursive: true });
+
+		// The HTML-export trap must surface as guidance, not via the TUI's
+		// fatal unclassified-error path (regression: a generic Error here
+		// killed the process).
+		const htmlPath = join(sessionDir, "export.html");
+		writeFileSync(htmlPath, "<!DOCTYPE html><html>...</html>", "utf8");
+		const htmlError = await runtimeHost.importFromJsonl(htmlPath).catch((e: unknown) => e);
+		expect(htmlError).toBeInstanceOf(SessionImportError);
+		expect((htmlError as Error).message).toMatch(/not a session JSONL/i);
+
+		const emptyPath = join(sessionDir, "empty.jsonl");
+		writeFileSync(emptyPath, "", "utf8");
+		const emptyError = await runtimeHost.importFromJsonl(emptyPath).catch((e: unknown) => e);
+		expect(emptyError).toBeInstanceOf(SessionImportError);
+		expect((emptyError as Error).message).toMatch(/empty/i);
 	});
 });

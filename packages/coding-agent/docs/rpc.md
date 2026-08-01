@@ -4,6 +4,30 @@ RPC mode enables headless operation of the coding agent via a JSON protocol over
 
 **Note for Node.js/TypeScript users**: If you're building a Node.js application, consider using `AgentSession` directly from `@earendil-works/pi-coding-agent` instead of spawning a subprocess. See [`src/core/agent-session.ts`](../src/core/agent-session.ts) for the API. For a subprocess-based TypeScript client, see [`src/modes/rpc/rpc-client.ts`](../src/modes/rpc/rpc-client.ts).
 
+**Platform scope**: v1 of the socket/attach transport assumes a POSIX agent
+host — `--sock` is a unix socket, `pi attach --cmd` spawns through the
+platform shell (`sh -c` on POSIX, `%COMSPEC%` on Windows), and session paths
+are interpreted with POSIX separators. Windows agents are not supported yet
+(a Windows *client* attaching to a POSIX agent works, e.g. `--cmd "ssh host
+pi --mode rpc"` via the native ssh.exe).
+
+**Compatibility notes for embedders**:
+- Stdio RPC mode now emits a `hello` greeting line first (same shape as the
+  socket handshake). Clients should ignore unknown top-level message types.
+- With an attached socket client, `entry_appended` events fire for *every*
+  session entry (not only extension custom entries), so the client can keep
+  a full mirror. Filter by entry type if you only care about custom entries.
+- `message_end` events carry a per-session monotonic `seq` stamp, and the
+  `get_messages` response includes the current high-water mark as
+  `messageSeq`: every `message_end` with `seq <= messageSeq` completed
+  before that snapshot was taken and is included in it. The converse is not
+  guaranteed — a snapshot may already contain a message whose stamp lands
+  after it — so clients mirroring messages should drop a queued
+  `message_end` when `seq <= messageSeq` and otherwise verify against the
+  snapshot before applying. The sequence restarts on every session switch;
+  older servers omit both fields, so clients must treat a missing `seq` as
+  "unknown".
+
 ## Starting RPC Mode
 
 ```bash
@@ -16,6 +40,58 @@ Common options:
 - `--name <name>` / `-n <name>`: Set the session display name at startup
 - `--no-session`: Disable session persistence
 - `--session-dir <path>`: Custom session storage directory
+- `--sock <path>`: Listen on a unix socket instead of stdio (mode `0600`;
+  the agent outlives clients — attach/detach/reattach supported)
+
+## Attaching the Stock TUI (`pi attach`)
+
+`pi attach` runs the full interactive TUI against an agent behind an RPC
+endpoint. No local session, model, or extension loading happens on the
+attach host — every session operation flows through the protocol, and the
+TUI is the stock one (same binary, same components).
+
+```bash
+# Attach to a long-lived agent over a unix socket
+pi attach --sock /tmp/agent.sock
+
+# Spawn the agent per attach through any exec bridge
+pi attach --cmd "docker exec -i sandbox pi --mode rpc"
+pi attach --cmd "ssh host pi --mode rpc"
+```
+
+Semantics:
+
+- **Settings split**: theme, keybindings, and editor preferences come from
+  the *client's* `~/.pi/agent/settings.json`. Session-scoped settings
+  (auto-compaction, retry, steering/follow-up mode) are session state and
+  flow through the protocol. Trust stores are client-local.
+- **Exit**: with `--cmd`, exiting the TUI sends `shutdown` (the agent is
+  per-attach). With `--sock`, exiting sends `detach` and the agent keeps
+  its session — reattaching resumes right where you left off.
+- **Takeover**: a second `--sock` attach takes over; the first client is
+  notified via the `detached` event and exits its TUI.
+- **`/resume`**: the session picker lists the *agent's* sessions over the
+  wire (`list_sessions`, `rename_session`); full-text search is limited
+  to session names/first messages.
+
+- `/login` and `/logout` work over the wire: the auth flow runs on the
+  agent host while its prompts/notifications are served by the attach
+  client's TUI dialogs (`login`, `logout`, `auth_response` commands and
+  `auth_prompt`/`auth_notify` events). OAuth flows that require a
+  localhost callback *on the agent host* (rather than a public redirect or
+  device code) cannot complete remotely.
+- `/import` works over the wire: the client reads the session file locally
+  and uploads its content (`import_session`); the agent writes it into its
+  session directory and switches to it.
+
+Known v1 degradations while attached:
+
+- Extension custom renderers fall back to default rendering; extension
+  *dialogs* (select/confirm/input/editor) render with stock TUI components.
+- `exportToJsonl`'s sync form is unavailable (the TUI's `/export` uses the
+  async form and works).
+- `@`-file completion browses the *client* filesystem (content expansion
+  happens agent-side only for agent-local paths).
 
 ## Protocol Overview
 
@@ -35,6 +111,36 @@ This matters for clients:
 - Do not use generic line readers that treat Unicode separators as newlines
 
 In particular, Node `readline` is not protocol-compliant for RPC mode because it also splits on `U+2028` and `U+2029`, which are valid inside JSON strings.
+
+### Hello Greeting
+
+The first line emitted by the server is a `hello` greeting. Clients should verify the protocol version before sending commands; until `hello` arrives, tolerate (and ignore) non-JSON lines, since transport shims (ssh banners, host-key confirmation, MOTDs) can write junk into the stream.
+
+```json
+{
+  "type": "hello",
+  "protocol": 1,
+  "version": "0.82.1",
+  "sessionId": "...",
+  "cwd": "/path/to/project",
+  "capabilities": ["shutdown", "detach", "fs_complete", "read_file", "list_sessions"]
+}
+```
+
+### Serving on a Unix Socket
+
+With `--sock`, the agent serves the identical protocol on a unix socket instead of stdio, and **outlives its clients**: clients attach, detach, and reattach while the session keeps running.
+
+```bash
+pi --mode rpc --sock ~/.pi/agent.sock
+```
+
+Socket semantics:
+- The socket file is created with `0600` permissions (only the owning user can connect).
+- A second concurrent client **takes over**: the previous client receives a `{"type": "detached", "reason": "takeover"}` event and is disconnected.
+- An explicit `detach` command ends the attachment; extension UI requests then auto-resolve immediately (headless behavior).
+- If the connection is *lost* without `detach`, pending and new extension UI requests are held for a 30s grace window and re-emitted to a reconnecting client; they auto-resolve when the window expires.
+- The `shutdown` command terminates the agent process.
 
 ## Commands
 
@@ -180,6 +286,7 @@ Response:
     "isCompacting": false,
     "steeringMode": "all",
     "followUpMode": "one-at-a-time",
+    "scopedModels": [{"model": {...}, "thinkingLevel": "low"}],
     "sessionFile": "/path/to/session.jsonl",
     "sessionId": "abc123",
     "sessionName": "my-feature-work",
@@ -788,6 +895,100 @@ Response:
 
 The current session name is available via `get_state` in the `sessionName` field. To set the initial name when starting RPC mode, pass `--name <name>` or `-n <name>` to the `pi --mode rpc` process.
 
+#### list_sessions
+
+List sessions known to the agent. By default lists sessions of the agent's cwd; pass `"all": true` to list across all projects. Dates are ISO strings. Combined with `switch_session`, this enables building a remote session picker.
+
+```json
+{"type": "list_sessions"}
+```
+
+Response:
+```json
+{
+  "type": "response",
+  "command": "list_sessions",
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "path": "/home/user/.pi/agent/sessions/--project/2026-01-01_....jsonl",
+        "id": "abc123",
+        "cwd": "/path/to/project",
+        "name": "refactor auth",
+        "created": "2026-01-01T00:00:00.000Z",
+        "modified": "2026-01-02T00:00:00.000Z",
+        "messageCount": 42,
+        "firstMessage": "Help me refactor..."
+      }
+    ]
+  }
+}
+```
+
+### Lifecycle
+
+#### shutdown
+
+Terminate the agent process gracefully. The response is sent before shutdown begins; the client receives a `{"type": "detached", "reason": "shutdown"}` event afterwards.
+
+```json
+{"type": "shutdown"}
+```
+
+#### detach
+
+End the client attachment while leaving the agent running (socket mode; in stdio mode the agent exits when stdin closes regardless). Outstanding extension UI requests auto-resolve with their defaults.
+
+```json
+{"type": "detach"}
+```
+
+### Filesystem
+
+These commands execute against the **agent-side** filesystem so clients attached over a transport (socket, ssh, container exec) can offer `@file` path completion and file mentions without local filesystem access. Relative paths resolve against the session cwd. No confinement is applied — the agent-side filesystem is the security boundary.
+
+#### fs_complete
+
+Fuzzy path completion, mirroring the TUI's `@file` suggestions (fixed pruning of `.git`/`node_modules`; `.gitignore` is not consulted in v1). Returns paths relative to the session cwd.
+
+```json
+{"type": "fs_complete", "prefix": "src/comp", "limit": 100}
+```
+
+Response:
+```json
+{
+  "type": "response",
+  "command": "fs_complete",
+  "success": true,
+  "data": {
+    "entries": [
+      {"path": "src/components", "isDirectory": true},
+      {"path": "src/components/button.tsx", "isDirectory": false}
+    ]
+  }
+}
+```
+
+#### read_file
+
+Read a UTF-8 text file for file mentions. Content is capped at 1 MiB (`truncated: true`); binary files are rejected.
+
+```json
+{"type": "read_file", "path": "README.md"}
+```
+
+Response:
+```json
+{
+  "type": "response",
+  "command": "read_file",
+  "success": true,
+  "data": {"path": "/abs/path/README.md", "content": "...", "truncated": false}
+}
+```
+
 ### Commands
 
 #### get_commands
@@ -826,8 +1027,158 @@ Each command has:
   - `"project"`: Project-level (`./.pi/agent/`)
   - `"path"`: Explicit path via CLI or settings
 - `path`: Absolute file path to the command source (optional)
+- `argumentHint`: Argument hint shown in autocomplete (optional, prompt templates only), e.g. `"<file> [focus]"`
 
 **Note**: Built-in TUI commands (`/settings`, `/hotkeys`, etc.) are not included. They are handled only in interactive mode and would not execute if sent via `prompt`.
+
+### Remote Attach
+
+These commands exist primarily for remote-attach clients (TUIs mirroring a
+session running elsewhere). All paths in responses are on the agent host.
+
+#### get_context_usage
+
+Estimated context usage of the current session, or `null` when unknown (e.g.
+right after compaction).
+
+```json
+{"type": "get_context_usage"}
+```
+
+Response data: `{"tokens": 1234, "contextWindow": 262144, "percent": 0.5}` or `null`.
+
+#### get_system_prompt
+
+The effective system prompt of the current session.
+
+```json
+{"type": "get_system_prompt"}
+```
+
+Response data: `{"systemPrompt": "..."}`.
+
+#### get_tools
+
+Tool definitions (name, description, parameter schema, prompt guidelines,
+source) active in the current session.
+
+```json
+{"type": "get_tools"}
+```
+
+Response data: `{"tools": [...]}`.
+
+#### get_resources
+
+Metadata about loaded resources for autocomplete and "loaded resources"
+displays. Prompt template content is omitted (expansion happens agent-side
+when prompting).
+
+```json
+{"type": "get_resources"}
+```
+
+Response data:
+```json
+{
+  "skills": [{"name": "...", "description": "...", "filePath": "...", "baseDir": "...", "disableModelInvocation": false}],
+  "prompts": [{"name": "fix-tests", "description": "...", "argumentHint": "<file>", "filePath": "..."}],
+  "themes": [...],
+  "extensions": [{"path": "...", "hidden": false}],
+  "extensionErrors": [{"path": "...", "error": "..."}],
+  "agentsFiles": [{"path": "..."}],
+  "systemPromptSource": {"path": "..."},
+  "appendSystemPromptSources": [{"path": "..."}]
+}
+```
+
+#### set_scoped_models
+
+Replace the scoped model list (the cycle-model UI candidates). Each entry
+references a model by `provider` + `id` and an optional preferred
+`thinkingLevel`. Unknown models are rejected.
+
+```json
+{"type": "set_scoped_models", "models": [{"provider": "anthropic", "id": "claude-sonnet-4-5", "thinkingLevel": "low"}]}
+```
+
+The current list is reported as `scopedModels` in `get_state`.
+
+#### navigate_tree
+
+Navigate the session tree, optionally with branch summarization. Mirrors the
+TUI's tree navigation.
+
+```json
+{"type": "navigate_tree", "targetId": "entry-id", "summarize": true, "customInstructions": "...", "replaceInstructions": false, "label": "..."}
+```
+
+Response data: `{"cancelled": false, "editorText": "..."}` — `editorText` is
+present when the navigation selected user text to edit.
+
+#### reload
+
+Reload settings, resources, and extensions in the agent process.
+
+```json
+{"type": "reload"}
+```
+
+#### export_jsonl
+
+Export the current session to a JSONL file. Returns the file path on the
+agent host.
+
+```json
+{"type": "export_jsonl", "outputPath": "/tmp/session.jsonl"}
+```
+
+Response data: `{"path": "/tmp/session.jsonl"}`.
+
+#### abort_compaction / abort_branch_summary
+
+Abort an in-progress compaction or branch summarization.
+
+```json
+{"type": "abort_compaction"}
+{"type": "abort_branch_summary"}
+```
+
+#### clear_queue
+
+Clear queued steering and follow-up messages. Returns the cleared queues.
+
+```json
+{"type": "clear_queue"}
+```
+
+Response data: `{"steering": ["..."], "followUp": ["..."]}`.
+
+#### get_auth_status
+
+Provider ids currently authenticated via OAuth on the agent host.
+
+```json
+{"type": "get_auth_status"}
+```
+
+Response data: `{"oauthProviders": ["anthropic"]}`.
+
+#### refresh_models
+
+Refresh model availability (re-checks credentials and provider catalogs).
+
+```json
+{"type": "refresh_models"}
+```
+
+#### rename_session
+
+Rename a session by file path (used by remote session pickers).
+
+```json
+{"type": "rename_session", "sessionPath": "/path/to/session.jsonl", "name": "my session"}
+```
 
 ## Events
 
@@ -1126,6 +1477,30 @@ For branch summaries, `source` is `"branchSummary"` and no `reason` is present.
   "type": "summarization_retry_finished"
 }
 ```
+
+### detached
+
+Emitted when the server ends a client attachment (socket mode, or before a `shutdown`).
+
+```json
+{"type": "detached", "reason": "takeover"}
+```
+
+`reason` is one of `"takeover"` (another client attached), `"shutdown"` (agent terminating), or `"detach"`.
+
+### session_changed
+
+Emitted when the server rebinds to a different session — e.g. an extension
+invoked `newSession`/`switchSession`/`fork` agent-side, or a client issued
+one of those commands. Remote-attach clients mirroring session state should
+refetch (`get_state`, `get_entries`, `get_messages`, …) on this event.
+
+```json
+{"type": "session_changed", "sessionId": "abc123", "cwd": "/path/to/project"}
+```
+
+The initial bind happens before any client attaches, so clients do not see
+an event for the session they greet in `hello`.
 
 ### extension_error
 

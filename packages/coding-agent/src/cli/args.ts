@@ -11,6 +11,8 @@ import type { UiMode } from "../core/settings-manager.ts";
 export type Mode = "text" | "json" | "rpc";
 
 export interface Args {
+	/** Remote attach subcommand: connect the interactive TUI to an agent over RPC. */
+	attach?: { command?: string; sock?: string };
 	provider?: string;
 	model?: string;
 	apiKey?: string;
@@ -47,6 +49,8 @@ export interface Args {
 	listModels?: string | true;
 	offline?: boolean;
 	uiMode?: UiMode;
+	/** Unix socket path for RPC mode (agent outlives clients; detach/reattach). */
+	sock?: string;
 	verbose?: boolean;
 	projectTrustOverride?: boolean;
 	messages: string[];
@@ -62,6 +66,90 @@ export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 	return VALID_THINKING_LEVELS.includes(level as ThinkingLevel);
 }
 
+/**
+ * A CLI subcommand: a different program matched on argv[0], with a flag
+ * grammar disjoint from the agent flags of the main parse loop (git push
+ * vs git pull, not another --flag). Declarative so parseSubcommand can run
+ * the shared scan — adding the next subcommand is a table entry, not a
+ * third copy of the loop machinery.
+ */
+interface Subcommand {
+	/** argv[0] keyword, e.g. "attach". */
+	readonly name: string;
+	/** Mark the parse result for dispatch (e.g. set result.attach = {}). */
+	readonly init: (result: Args) => void;
+	/** Flags that consume the next argv element as their value. */
+	readonly valueFlags: ReadonlySet<string>;
+	/** Boolean flags that take no value. */
+	readonly boolFlags: ReadonlySet<string>;
+	/** Apply one parsed flag; value is set iff the flag is a value flag. */
+	readonly apply: (result: Args, flag: string, value?: string) => void;
+	/** Cross-flag invariants checked after the scan; push diagnostics. */
+	readonly validate?: (result: Args) => void;
+}
+
+const attachSubcommand: Subcommand = {
+	name: "attach",
+	init: (result) => {
+		result.attach = {};
+	},
+	valueFlags: new Set(["--cmd", "--sock"]),
+	boolFlags: new Set(["--help", "-h", "--verbose"]),
+	apply(result, flag, value) {
+		const attach = result.attach;
+		if (!attach) return;
+		switch (flag) {
+			case "--cmd":
+				attach.command = value;
+				break;
+			case "--sock":
+				attach.sock = value;
+				break;
+			case "--help":
+			case "-h":
+				result.help = true;
+				break;
+			case "--verbose":
+				result.verbose = true;
+				break;
+		}
+	},
+	validate(result) {
+		const attach = result.attach;
+		if (!attach) return;
+		if (!result.help && !attach.command && !attach.sock) {
+			result.diagnostics.push({ type: "error", message: "attach requires --cmd <command> or --sock <path>" });
+		}
+		if (attach.command && attach.sock) {
+			result.diagnostics.push({ type: "error", message: "attach: --cmd and --sock are mutually exclusive" });
+		}
+	},
+};
+
+/** Every subcommand parseArgs dispatches before the main flag loop. */
+const subcommands: readonly Subcommand[] = [attachSubcommand];
+
+/** Run a subcommand's declarative grammar over its argv (after the keyword). */
+function parseSubcommand(spec: Subcommand, argv: string[], result: Args): Args {
+	spec.init(result);
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (spec.valueFlags.has(arg)) {
+			if (i + 1 < argv.length) {
+				spec.apply(result, arg, argv[++i]);
+			} else {
+				result.diagnostics.push({ type: "error", message: `${spec.name}: ${arg} requires a value` });
+			}
+		} else if (spec.boolFlags.has(arg)) {
+			spec.apply(result, arg);
+		} else {
+			result.diagnostics.push({ type: "error", message: `Unknown argument for ${spec.name}: ${arg}` });
+		}
+	}
+	spec.validate?.(result);
+	return result;
+}
+
 export function parseArgs(args: string[]): Args {
 	const result: Args = {
 		messages: [],
@@ -69,6 +157,13 @@ export function parseArgs(args: string[]): Args {
 		unknownFlags: new Map(),
 		diagnostics: [],
 	};
+
+	// Subcommands match on argv[0] and own everything after it; their flag
+	// sets are disjoint from the agent flags parsed by the main loop below.
+	const subcommand = subcommands.find((spec) => spec.name === args[0]);
+	if (subcommand) {
+		return parseSubcommand(subcommand, args.slice(1), result);
+	}
 
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
@@ -82,6 +177,8 @@ export function parseArgs(args: string[]): Args {
 			if (mode === "text" || mode === "json" || mode === "rpc") {
 				result.mode = mode;
 			}
+		} else if (arg === "--sock" && i + 1 < args.length) {
+			result.sock = args[++i];
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
 		} else if (arg === "--resume" || arg === "-r") {
@@ -251,6 +348,9 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} list                      List installed extensions from settings
   ${APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
   ${APP_NAME} auth <command>            Print credentials for external clients
+  ${APP_NAME} attach (--cmd <command> | --sock <path>)
+                                 Attach the interactive TUI to an agent served
+                                 over RPC (--mode rpc [--sock <path>])
   ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth
 
 ${chalk.bold("Options:")}
@@ -260,6 +360,9 @@ ${chalk.bold("Options:")}
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
+  --sock <path>                  With --mode rpc: serve the RPC protocol on a
+                                 unix socket instead of stdio. The agent outlives
+                                 clients; attach/detach/reattach are supported.
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume

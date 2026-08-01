@@ -55,6 +55,71 @@ const getSuggestions = (
 ) => provider.getSuggestions(lines, cursorLine, cursorCol, { signal: new AbortController().signal, force });
 
 describe("CombinedAutocompleteProvider", () => {
+	describe("fileSearcher", () => {
+		it("uses a custom file searcher for @-completion instead of fd", async () => {
+			const calls: string[] = [];
+			const provider = new CombinedAutocompleteProvider([], "/nonexistent-base", null, async (query) => {
+				calls.push(query);
+				return [
+					{ path: "src/main.go", isDirectory: false },
+					{ path: "src", isDirectory: true },
+				];
+			});
+			const result = await getSuggestions(provider, ["@mai"], 0, 4);
+			assert.notEqual(result, null, "custom searcher should produce suggestions");
+			assert.deepEqual(calls, ["mai"]);
+			const labels = result!.items.map((item) => item.label);
+			assert.ok(labels.includes("main.go"), `expected main.go in ${labels}`);
+		});
+
+		it("does not re-score server-scoped results against the raw query", async () => {
+			// Regression: the provider scored searcher results against the RAW
+			// query ("src/f"), rejecting valid scoped hits — "src/f" is not
+			// contiguous in "src/components/foo.ts".
+			const provider = new CombinedAutocompleteProvider([], "/nonexistent-base", null, async (query) => {
+				assert.equal(query, "src/f");
+				return [
+					{ path: "src/components/foo.ts", isDirectory: false },
+					{ path: "src/forms.ts", isDirectory: false },
+				];
+			});
+			const result = await getSuggestions(provider, ["@src/f"], 0, 6);
+			assert.notEqual(result, null, "scoped hits must survive");
+			const values = result!.items.map((item) => item.value);
+			assert.ok(values.includes("@src/components/foo.ts"), `expected foo.ts in ${values}`);
+			assert.ok(values.includes("@src/forms.ts"), `expected forms.ts in ${values}`);
+		});
+
+		it("returns null when the custom searcher yields nothing", async () => {
+			const provider = new CombinedAutocompleteProvider([], "/nonexistent-base", null, async () => []);
+			const result = await getSuggestions(provider, ["@zzz"], 0, 4);
+			assert.strictEqual(result, null);
+		});
+
+		it("passes scoped queries through unmodified when the directory also exists locally", async () => {
+			// Regression: a custom searcher (attach mode's RPC fs_complete)
+			// searches the AGENT's filesystem. When the local base happens to
+			// contain the same directory name, the provider used to split
+			// "@src/fo" with a LOCAL stat, send only "fo", then re-prefix the
+			// agent's already-scoped results into "src/src/foo.ts".
+			const base = mkdtempSync(join(tmpdir(), "tui-autocomplete-"));
+			mkdirSync(join(base, "src"));
+			const calls: string[] = [];
+			const provider = new CombinedAutocompleteProvider([], base, null, async (query) => {
+				calls.push(query);
+				return [{ path: "src/foo.ts", isDirectory: false }];
+			});
+			try {
+				const result = await getSuggestions(provider, ["@src/fo"], 0, 7);
+				assert.deepEqual(calls, ["src/fo"], "raw query must reach the searcher");
+				const values = result!.items.map((item) => item.value);
+				assert.deepEqual(values, ["@src/foo.ts"], "no scoped re-prefix");
+			} finally {
+				rmSync(base, { recursive: true, force: true });
+			}
+		});
+	});
+
 	describe("extractPathPrefix", () => {
 		it("extracts / from 'hey /' when forced", async () => {
 			const provider = new CombinedAutocompleteProvider([], "/tmp");

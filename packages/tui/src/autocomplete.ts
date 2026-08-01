@@ -222,6 +222,17 @@ export interface AutocompleteItem {
 	description?: string;
 }
 
+/**
+ * Custom file listing strategy for @-completion (e.g. an RPC client
+ * completing against a remote agent's filesystem). Returns entries with
+ * paths relative to the directory part of the query — the same contract
+ * as the built-in fd walker.
+ */
+export type AutocompleteFileSearcher = (
+	query: string,
+	options: { signal: AbortSignal },
+) => Promise<Array<{ path: string; isDirectory: boolean }>>;
+
 type Awaitable<T> = T | Promise<T>;
 
 export interface SlashCommand {
@@ -274,11 +285,18 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	private commands: (SlashCommand | AutocompleteItem)[];
 	private basePath: string;
 	private fdPath: string | null;
+	private fileSearcher: AutocompleteFileSearcher | null;
 
-	constructor(commands: (SlashCommand | AutocompleteItem)[] = [], basePath: string, fdPath: string | null = null) {
+	constructor(
+		commands: (SlashCommand | AutocompleteItem)[] = [],
+		basePath: string,
+		fdPath: string | null = null,
+		fileSearcher: AutocompleteFileSearcher | null = null,
+	) {
 		this.commands = commands;
 		this.basePath = basePath;
 		this.fdPath = fdPath;
+		this.fileSearcher = fileSearcher;
 	}
 
 	async getSuggestions(
@@ -721,23 +739,36 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		query: string,
 		options: { isQuotedPrefix: boolean; signal: AbortSignal },
 	): Promise<AutocompleteItem[]> {
-		if (!this.fdPath || options.signal.aborted) {
+		if ((!this.fdPath && !this.fileSearcher) || options.signal.aborted) {
 			return [];
 		}
 
 		try {
-			const scopedQuery = this.resolveScopedFuzzyQuery(query);
+			// A custom fileSearcher (e.g. attach mode's RPC fs_complete)
+			// searches the AGENT's filesystem and does its own dir-scoping —
+			// splitting the query here would stat the LOCAL filesystem and
+			// misjudge the scope whenever the same directory name exists on
+			// both hosts (always true for same-host socket attach), then
+			// re-prefix results it never stripped. Pass the raw query through.
+			const scopedQuery = this.fileSearcher ? null : this.resolveScopedFuzzyQuery(query);
 			const fdBaseDir = scopedQuery?.baseDir ?? this.basePath;
 			const fdQuery = scopedQuery?.query ?? query;
-			const entries = await walkDirectoryWithFd(fdBaseDir, this.fdPath, fdQuery, 100, options.signal);
+			const entries = this.fileSearcher
+				? await this.fileSearcher(fdQuery, { signal: options.signal })
+				: await walkDirectoryWithFd(fdBaseDir, this.fdPath!, fdQuery, 100, options.signal);
 			if (options.signal.aborted) {
 				return [];
 			}
 
+			// A custom fileSearcher already scoped and ranked its results
+			// (agent-side fs_complete): re-scoring them against the RAW query
+			// would reject valid hits (e.g. "src/f" is not contiguous in
+			// "src/components/foo.ts"). Trust the searcher's order (score 1
+			// ties → stable sort preserves it).
 			const scoredEntries = entries
 				.map((entry) => ({
 					...entry,
-					score: fdQuery ? this.scoreEntry(entry.path, fdQuery, entry.isDirectory) : 1,
+					score: this.fileSearcher || !fdQuery ? 1 : this.scoreEntry(entry.path, fdQuery, entry.isDirectory),
 				}))
 				.filter((entry) => entry.score > 0);
 
@@ -746,7 +777,9 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 
 			const suggestions: AutocompleteItem[] = [];
 			for (const { path: entryPath, isDirectory } of topEntries) {
-				const pathWithoutSlash = isDirectory ? entryPath.slice(0, -1) : entryPath;
+				// fd walker entries end in "/" for directories; custom searchers
+				// (e.g. RPC fs_complete) may not — normalize without assuming.
+				const pathWithoutSlash = isDirectory && entryPath.endsWith("/") ? entryPath.slice(0, -1) : entryPath;
 				const displayPath = scopedQuery
 					? this.scopedPathForDisplay(scopedQuery.displayBase, pathWithoutSlash)
 					: pathWithoutSlash;

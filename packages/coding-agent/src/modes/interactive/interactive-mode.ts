@@ -24,6 +24,7 @@ import type {
 } from "@earendil-works/pi-tui";
 import * as TuiLayouts from "@earendil-works/pi-tui";
 import {
+	type AutocompleteFileSearcher,
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
@@ -56,7 +57,7 @@ import {
 	VERSION,
 } from "../../config.ts";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
-import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
+import { type AgentSessionRuntime, SessionImportError } from "../../core/agent-session-runtime.ts";
 import {
 	CACHE_TTL_MS,
 	type CacheMiss,
@@ -133,7 +134,7 @@ import {
 	OAuthSelectorComponent,
 } from "./components/oauth-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
-import { SessionSelectorComponent } from "./components/session-selector.ts";
+import { SessionSelectorComponent, type SessionsLoader } from "./components/session-selector.ts";
 import { SettingsSelectorComponent } from "./components/settings-selector.ts";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
 import {
@@ -307,6 +308,22 @@ function formatLoginProviderCompletionDescription(provider: LoginProviderComplet
 	return provider.name === provider.id ? authTypes : `${provider.name} · ${authTypes}`;
 }
 
+/** Hooks to source the /resume session picker from something other than the local filesystem. */
+export interface SessionPickerHooks {
+	/** Load sessions for the current directory (onProgress receives partial results). */
+	list: SessionsLoader;
+	/** Load sessions across all directories. */
+	listAll: SessionsLoader;
+	/** Rename a session. Defaults to opening the session file locally. */
+	renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
+	/**
+	 * Delete a session. Defaults to local trash/unlink — wrong for remote
+	 * sessions (agent paths may not exist client-side, and a colliding local
+	 * path would delete an unrelated file), so attach mode must provide this.
+	 */
+	deleteSession?: (sessionPath: string) => Promise<{ ok: boolean; error?: string }>;
+}
+
 /**
  * Options for InteractiveMode initialization.
  */
@@ -327,6 +344,10 @@ export interface InteractiveModeOptions {
 	verbose?: boolean;
 	/** UI layout mode. */
 	uiMode?: UiMode;
+	/** Override where the /resume session picker gets its data (e.g. remote attach). */
+	sessionPicker?: SessionPickerHooks;
+	/** Custom @-file completion source (e.g. RPC fs_complete against a remote agent). */
+	fileCompletion?: AutocompleteFileSearcher;
 }
 
 interface InteractiveTuiOptions {
@@ -664,6 +685,7 @@ export class InteractiveMode {
 			[...slashCommands, ...templateCommands, ...extensionCommands, ...skillCommandList],
 			this.sessionManager.getCwd(),
 			this.fdPath,
+			this.options?.fileCompletion ?? null,
 		);
 	}
 
@@ -4862,13 +4884,16 @@ export class InteractiveMode {
 
 	private showSessionSelector(): void {
 		this.showSelector((done) => {
+			const picker = this.options.sessionPicker;
 			const selector = new SessionSelectorComponent(
-				(onProgress) =>
-					SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress),
-				(onProgress) =>
-					this.sessionManager.usesDefaultSessionDir()
-						? SessionManager.listAll(onProgress)
-						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress),
+				picker?.list ??
+					((onProgress) =>
+						SessionManager.list(this.sessionManager.getCwd(), this.sessionManager.getSessionDir(), onProgress)),
+				picker?.listAll ??
+					((onProgress) =>
+						this.sessionManager.usesDefaultSessionDir()
+							? SessionManager.listAll(onProgress)
+							: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress)),
 				async (sessionPath) => {
 					done();
 					await this.handleResumeSession(sessionPath);
@@ -4882,12 +4907,15 @@ export class InteractiveMode {
 				},
 				() => this.ui.requestRender(),
 				{
-					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
-						const next = (nextName ?? "").trim();
-						if (!next) return;
-						const mgr = SessionManager.open(sessionFilePath);
-						mgr.appendSessionInfo(next);
-					},
+					renameSession:
+						picker?.renameSession ??
+						(async (sessionFilePath: string, nextName: string | undefined) => {
+							const next = (nextName ?? "").trim();
+							if (!next) return;
+							const mgr = SessionManager.open(sessionFilePath);
+							mgr.appendSessionInfo(next);
+						}),
+					deleteSession: picker?.deleteSession,
 					showRenameHint: true,
 					keybindings: this.keybindings,
 				},
@@ -5503,7 +5531,13 @@ export class InteractiveMode {
 
 		try {
 			if (outputPath?.endsWith(".jsonl")) {
-				const filePath = this.session.exportToJsonl(outputPath);
+				// Remote runtimes (attach mode) implement the async variant; the
+				// sync exportToJsonl throws there since it crosses a process boundary.
+				const asyncExport = (this.session as { exportToJsonlAsync?: (path?: string) => Promise<string> })
+					.exportToJsonlAsync;
+				const filePath = asyncExport
+					? await asyncExport.call(this.session, outputPath)
+					: this.session.exportToJsonl(outputPath);
 				this.showStatus(`Session exported to: ${filePath}`);
 			} else {
 				const filePath = await this.session.exportToHtml(outputPath);
@@ -5579,7 +5613,7 @@ export class InteractiveMode {
 				this.showStatus(`Session imported from: ${inputPath}`);
 				return;
 			}
-			if (error instanceof SessionImportFileNotFoundError) {
+			if (error instanceof SessionImportError) {
 				this.showError(`Failed to import session: ${error.message}`);
 				return;
 			}
