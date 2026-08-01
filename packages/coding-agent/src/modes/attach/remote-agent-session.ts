@@ -37,6 +37,7 @@ import { addUsageToTotals, createUsageTotals } from "../../core/usage-totals.ts"
 import type { Theme } from "../interactive/theme/theme.ts";
 import type { ModelInfo, RpcClient, RpcServerEvent } from "../rpc/rpc-client.ts";
 import type { RpcAuthStatus, RpcExtensionUIRequest, RpcResources, RpcSlashCommand } from "../rpc/rpc-types.ts";
+import { attachTimingEnabled, recordTiming } from "./timing.ts";
 
 export interface RemoteAgentSessionOptions {
 	client: RpcClient;
@@ -252,19 +253,36 @@ export class RemoteAgentSession implements MirroredSessionSurface {
 		// told apart from a state refresh during a turn this client started.
 		const wasStreaming = this.mirror.isStreaming;
 		const wasCompacting = this.mirror.isCompacting;
+		// PI_ATTACH_TIMING=1: per-RPC latency + payload size. This is where
+		// "re-attach got slow" shows up — the cost is the transcript size,
+		// not the wall time since the last attach.
+		const timed = <T>(name: string, p: Promise<T>): Promise<T> => {
+			if (!attachTimingEnabled()) return p;
+			const t = performance.now();
+			return p.then((v) => {
+				let size = "";
+				try {
+					size = `${(JSON.stringify(v).length / 1024).toFixed(0)}KB`;
+				} catch {
+					// best-effort sizing only
+				}
+				recordTiming(`refetch:${name}`, t, size);
+				return v;
+			});
+		};
 		const [state, entries, messages, systemPrompt, usage, tools, levels, models, auth, resources, commands] =
 			await Promise.all([
-				this.client.getState(),
-				this.client.getEntries(),
-				this.client.getMessagesWithSeq(),
-				this.client.getSystemPrompt(),
-				this.client.getContextUsage(),
-				this.client.getTools(),
-				this.client.getAvailableThinkingLevels(),
-				this.client.getAvailableModels(),
-				this.client.getAuthStatus(),
-				this.client.getResources(),
-				this.client.getCommands(),
+				timed("getState", this.client.getState()),
+				timed("getEntries", this.client.getEntries()),
+				timed("getMessagesWithSeq", this.client.getMessagesWithSeq()),
+				timed("getSystemPrompt", this.client.getSystemPrompt()),
+				timed("getContextUsage", this.client.getContextUsage()),
+				timed("getTools", this.client.getTools()),
+				timed("getAvailableThinkingLevels", this.client.getAvailableThinkingLevels()),
+				timed("getAvailableModels", this.client.getAvailableModels()),
+				timed("getAuthStatus", this.client.getAuthStatus()),
+				timed("getResources", this.client.getResources()),
+				timed("getCommands", this.client.getCommands()),
 			]);
 
 		this.mirror = {

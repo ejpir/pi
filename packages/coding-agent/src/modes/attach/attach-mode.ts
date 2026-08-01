@@ -20,6 +20,7 @@ import { RpcClient } from "../rpc/rpc-client.ts";
 import type { RpcSessionInfo } from "../rpc/rpc-types.ts";
 import { RemoteAgentSession } from "./remote-agent-session.ts";
 import { asAgentSessionRuntime, RemoteAgentSessionRuntime } from "./remote-runtime.ts";
+import { enableAttachTiming, recordTiming } from "./timing.ts";
 
 export interface AttachModeOptions {
 	/** Shell command to spawn the agent with (exclusive with socketPath). */
@@ -57,10 +58,17 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 		throw new Error("--cmd and --sock are mutually exclusive");
 	}
 
+	if (options.verbose || process.env.PI_ATTACH_TIMING === "1") {
+		enableAttachTiming();
+		console.error("attach timing → ~/.pi/attach-timing.log");
+	}
+	const tStart = performance.now();
+
 	const client = new RpcClient(
 		options.socketPath ? { socketPath: options.socketPath } : { command: options.command! },
 	);
 	await client.start();
+	recordTiming("client.start (transport spawn + hello)", tStart);
 
 	const stopClientQuietly = async (): Promise<void> => {
 		await client.stop().catch(() => {});
@@ -80,7 +88,9 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 		settingsManager = SettingsManager.create(options.cwd, options.agentDir);
 		initTheme(settingsManager.getTheme(), true);
 
+		const tConnect = performance.now();
 		remote = await RemoteAgentSession.connect({ client, settingsManager });
+		recordTiming("RemoteAgentSession.connect (refetchAll)", tConnect);
 		runtime = new RemoteAgentSessionRuntime({
 			client,
 			session: remote,
@@ -175,6 +185,7 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 		},
 	};
 
+	const tTui = performance.now();
 	const interactive = new InteractiveMode(asAgentSessionRuntime(runtime), {
 		sessionPicker,
 		// @-completion must query the agent's filesystem, not the attach host's.
@@ -189,6 +200,7 @@ export async function runAttachMode(options: AttachModeOptions): Promise<void> {
 		verbose: options.verbose,
 	});
 	interactiveRef = interactive;
+	recordTiming("InteractiveMode init", tTui);
 	if (exitScheduled) {
 		// Takeover raced ahead of startup; restore the terminal before the exit lands.
 		interactive.stop();
