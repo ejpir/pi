@@ -774,14 +774,16 @@ export class RpcServer {
 				// hang for minutes on networks the agent's proxy config doesn't
 				// cover (the hazard refreshTimeoutMs documents for
 				// refresh_models). This command rides in EVERY attach's
-				// refetchAll, so apply the same bound: on timeout serve the
-				// in-memory snapshot; the refresh keeps running in the
-				// background and its result lands for the next caller.
+				// refetchAll, so apply the same bound — but much tighter: the
+				// in-memory snapshot is a perfectly good answer for the model
+				// picker, so on a slow/hung refresh (>5s) serve the snapshot and
+				// let the refresh land in the background for the next caller.
+				const boundMs = Math.min(this.refreshTimeoutMs, 5_000);
 				let timer: NodeJS.Timeout | undefined;
 				const models = await Promise.race([
 					session.modelRuntime.getAvailable(),
 					new Promise<null>((resolve) => {
-						timer = setTimeout(() => resolve(null), this.refreshTimeoutMs);
+						timer = setTimeout(() => resolve(null), boundMs);
 					}),
 				]).finally(() => clearTimeout(timer));
 				return this.success(id, "get_available_models", {
