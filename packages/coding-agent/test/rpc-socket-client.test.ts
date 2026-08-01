@@ -299,6 +299,29 @@ process.stdout.write(
 		expect(refreshCalls).toBe(1);
 	});
 
+	it("get_available_models is bounded and falls back to the snapshot", async () => {
+		await startFixture({ refreshTimeoutMs: 200 });
+		// A hung availability refresh must not stall every attach's refetchAll:
+		// the handler races it against refreshTimeoutMs and serves the
+		// in-memory snapshot instead (refresh_models already had this bound).
+		const rt = session!.modelRuntime as unknown as {
+			getAvailable: () => Promise<readonly unknown[]>;
+			getAvailableSnapshot: () => readonly unknown[];
+		};
+		rt.getAvailable = () => new Promise(() => {});
+		rt.getAvailableSnapshot = () => [{ id: "snapshot-model", provider: "anthropic" }];
+
+		const client = newClient();
+		await client.start();
+		const started = Date.now();
+		const models = await client.getAvailableModels();
+		expect(Date.now() - started).toBeLessThan(10_000);
+		expect(models.map((m) => m.id)).toContain("snapshot-model");
+		// The sequential queue is not jammed behind the still-hung refresh.
+		const state = await client.getState();
+		expect(state.sessionId).toBeTruthy();
+	});
+
 	it("rejects commands from a superseded (taken-over) connection", async () => {
 		await startFixture();
 		const client1 = newClient();

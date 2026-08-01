@@ -770,8 +770,23 @@ export class RpcServer {
 			}
 
 			case "get_available_models": {
-				const models = await session.modelRuntime.getAvailable();
-				return this.success(id, "get_available_models", { models });
+				// getAvailable() triggers a full availability refresh, which can
+				// hang for minutes on networks the agent's proxy config doesn't
+				// cover (the hazard refreshTimeoutMs documents for
+				// refresh_models). This command rides in EVERY attach's
+				// refetchAll, so apply the same bound: on timeout serve the
+				// in-memory snapshot; the refresh keeps running in the
+				// background and its result lands for the next caller.
+				let timer: NodeJS.Timeout | undefined;
+				const models = await Promise.race([
+					session.modelRuntime.getAvailable(),
+					new Promise<null>((resolve) => {
+						timer = setTimeout(() => resolve(null), this.refreshTimeoutMs);
+					}),
+				]).finally(() => clearTimeout(timer));
+				return this.success(id, "get_available_models", {
+					models: models ?? session.modelRuntime.getAvailableSnapshot(),
+				});
 			}
 
 			// =================================================================
